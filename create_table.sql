@@ -1,0 +1,79 @@
+name: Scrape MUSINSA Ranking
+
+# ===========================================
+# Cronスケジュール
+#   現在: 週1回 (毎週月曜 03:00 JST = 18:00 UTC日曜)
+#
+# 切り替え方:
+#   毎日にする → cron: '0 18 * * *'
+#   週1のまま  → cron: '0 18 * * 0'  (デフォルト)
+#
+# 時刻調整:
+#   GitHub ActionsはUTC基準。JST = UTC + 9時間。
+#   例) JST 03:00 → UTC 18:00 (前日)
+# ===========================================
+
+on:
+  schedule:
+    # 毎週月曜 03:00 JST (= 日曜 18:00 UTC)
+    - cron: '0 18 * * 0'
+  workflow_dispatch:  # 手動実行も可能
+    inputs:
+      skip_overall:
+        description: '女性全体ランキングをスキップ'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      skip_brand:
+        description: 'ブランドランキングをスキップ'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # BigQuery
+      BQ_TABLE: ${{ secrets.BQ_TABLE }}           # 例: my-project.musinsa.ranking
+      GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
+
+      # スプレッドシート
+      GSHEETS_SPREADSHEET_ID: ${{ secrets.GSHEETS_SPREADSHEET_ID }}
+
+      # Slack
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Write GCP credentials
+        run: |
+          echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > gcp-key.json
+
+      - name: Run scraper
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.skip_overall }}" = "true" ]; then ARGS="$ARGS --skip-overall"; fi
+          if [ "${{ github.event.inputs.skip_brand }}" = "true" ]; then ARGS="$ARGS --skip-brand"; fi
+          python -m src.main $ARGS
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f gcp-key.json
