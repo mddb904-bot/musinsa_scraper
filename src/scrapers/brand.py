@@ -1,11 +1,16 @@
-"""ブランド独自ランキング スクレイパー (デバッグ強化版 v3)。"""
+"""ブランド独自ランキング スクレイパー v4。
+
+Playwrightでページを完全レンダリングした後、HTMLから複数パターンを試して
+商品データを抽出する。
+"""
 from __future__ import annotations
 
 import json as json_lib
 import logging
+import re
 import time
 
-from playwright.sync_api import sync_playwright, Response
+from playwright.sync_api import sync_playwright
 
 from ..parser import find_goods_in_obj, extract_goods_list_from_html
 
@@ -16,6 +21,79 @@ _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+
+def _extract_items_from_html(html: str, brand_slug: str) -> list[dict]:
+    """複数の埋め込みパターンを試してHTMLから商品データを抽出する。"""
+    # Strategy 1: const goodsList = "..." (既存パターン)
+    try:
+        items = extract_goods_list_from_html(html)
+        if items:
+            logger.info("brand=%s: Extracted %d items via goodsList pattern", brand_slug, len(items))
+            return items
+    except Exception:
+        pass
+
+    # Strategy 2: <script id="__NEXT_DATA__"> (Next.js)
+    m = re.search(
+        r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+        html, re.DOTALL,
+    )
+    if m:
+        try:
+            data = json_lib.loads(m.group(1))
+            items = find_goods_in_obj(data)
+            if items:
+                logger.info("brand=%s: Extracted %d items via __NEXT_DATA__", brand_slug, len(items))
+                return items
+        except Exception as e:
+            logger.debug("__NEXT_DATA__ parse failed: %s", e)
+
+    # Strategy 3: 任意の <script type="application/json"> から goods データ
+    for m in re.finditer(
+        r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>',
+        html, re.DOTALL,
+    ):
+        try:
+            data = json_lib.loads(m.group(1))
+            items = find_goods_in_obj(data)
+            if items:
+                logger.info(
+                    "brand=%s: Extracted %d items via application/json script",
+                    brand_slug, len(items),
+                )
+                return items
+        except Exception:
+            continue
+
+    # Strategy 4: window.__INITIAL_STATE__ など
+    for var_name in ["__INITIAL_STATE__", "__PRELOADED_STATE__", "__NUXT__", "__APOLLO_STATE__"]:
+        m = re.search(
+            rf'window\.{re.escape(var_name)}\s*=\s*(\{{.*?\}});?\s*</script>',
+            html, re.DOTALL,
+        )
+        if m:
+            try:
+                data = json_lib.loads(m.group(1))
+                items = find_goods_in_obj(data)
+                if items:
+                    logger.info(
+                        "brand=%s: Extracted %d items via window.%s",
+                        brand_slug, len(items), var_name,
+                    )
+                    return items
+            except Exception:
+                continue
+
+    # Strategy 5: 最後の手段 - HTML 内のキーワードを報告
+    logger.warning(
+        "[DEBUG] brand=%s: No extraction strategy worked. HTML keyword presence:",
+        brand_slug,
+    )
+    for kw in ["__NEXT_DATA__", "goodsNo", "goodsInfoList", "goodsList", "brandId", "rankingList"]:
+        logger.warning("  '%s' in HTML: %s", kw, kw in html)
+
+    return []
 
 
 def fetch_brand_ranking(
@@ -29,45 +107,10 @@ def fetch_brand_ranking(
         raise ValueError(f"period must be 'weekly' or 'monthly', got: {period}")
 
     url = f"https://global.musinsa.com/jp/brands/{brand_slug}/trending?period={period}"
-    logger.info("Loading brand page: brand=%s period=%s url=%s", brand_slug, period, url)
+    logger.info("Loading brand page: brand=%s period=%s", brand_slug, period)
 
-    captured: list[tuple[str, list[dict]]] = []
-    all_xhr: list[tuple[str, str, int, int]] = []  # (url, ct, status, body_len)
     brand_lower = brand_slug.lower()
-
-    def on_response(response: Response) -> None:
-        try:
-            rtype = response.request.resource_type
-            if rtype not in ("fetch", "xhr"):
-                return
-            url_str = response.url
-            try:
-                ct = response.headers.get("content-type", "")
-            except Exception:
-                ct = ""
-            status = response.status
-            body_len = 0
-            json_data = None
-            if "application/json" in ct or "text/json" in ct:
-                try:
-                    text = response.text()
-                    body_len = len(text)
-                    if text:
-                        json_data = json_lib.loads(text)
-                except Exception:
-                    pass
-            all_xhr.append((url_str, ct[:60], status, body_len))
-
-            if json_data is not None:
-                items = find_goods_in_obj(json_data)
-                if items:
-                    logger.info(
-                        "[CAPTURE] brand=%s %d items from %s (body=%d)",
-                        brand_slug, len(items), url_str[:180], body_len,
-                    )
-                    captured.append((url_str, items))
-        except Exception as e:
-            logger.debug("on_response error: %s", e)
+    html = ""
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -77,84 +120,51 @@ def fetch_brand_ranking(
             viewport={"width": 1280, "height": 1800},
         )
         page = context.new_page()
-        page.on("response", on_response)
 
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         except Exception as e:
             logger.warning("page.goto: %s", e)
 
-        # 初期APIコール待ち (長めに5秒)
+        # JS実行待ち
         time.sleep(5)
 
-        prev_count = 0
-        for i in range(20):
+        # スクロールしてlazy-load発火
+        for i in range(15):
             page.mouse.wheel(0, 5000)
-            time.sleep(0.8)
-            current_count = sum(len(items) for _, items in captured)
-            if current_count >= top_n * 2:
-                break
-            if current_count == prev_count and i > 5:
-                logger.info(
-                    "brand=%s period=%s: no new items after scroll %d",
-                    brand_slug, period, i,
-                )
-                break
-            prev_count = current_count
+            time.sleep(0.5)
 
-        # フォールバック: HTMLから抽出を試す
-        if not captured:
-            try:
-                html = page.content()
-                logger.info(
-                    "brand=%s: HTML extraction fallback (page=%d bytes)",
-                    brand_slug, len(html),
-                )
-                try:
-                    items = extract_goods_list_from_html(html)
-                    if items:
-                        captured.append(("html-fallback", items))
-                        logger.info("HTML extracted %d items", len(items))
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning("page.content() failed: %s", e)
-
-        # 失敗時: 全XHR URL を WARN レベルで出す (ログに必ず残る)
-        if not captured:
-            logger.warning(
-                "[DEBUG] brand=%s period=%s NO ITEMS - %d XHR responses:",
-                brand_slug, period, len(all_xhr),
-            )
-            for i, (u, ct, status, blen) in enumerate(all_xhr[:25]):
-                logger.warning(
-                    "  [%d] status=%d ct=%s len=%d url=%s",
-                    i, status, ct, blen, u[:180],
-                )
+        # レンダリング後のHTMLを取得
+        try:
+            html = page.content()
+            logger.info("brand=%s: page HTML size=%d bytes", brand_slug, len(html))
+        except Exception as e:
+            logger.warning("page.content() failed: %s", e)
 
         browser.close()
 
+    # HTMLから商品データを抽出
+    raw_items = _extract_items_from_html(html, brand_slug)
+
+    # 重複排除 + ブランドフィルタ
     seen_ids: set[str] = set()
     results: list[dict] = []
     skipped = 0
-    for _, items in captured:
-        for item in items:
-            gid = str(item.get("goodsNo") or "")
-            if not gid or gid in seen_ids:
-                continue
-            seen_ids.add(gid)
-            item_brand = str(item.get("brandId") or "").lower()
-            if item_brand and item_brand != brand_lower:
-                skipped += 1
-                continue
-            results.append(item)
-            if len(results) >= top_n:
-                break
+    for item in raw_items:
+        gid = str(item.get("goodsNo") or "")
+        if not gid or gid in seen_ids:
+            continue
+        seen_ids.add(gid)
+        item_brand = str(item.get("brandId") or "").lower()
+        if item_brand and item_brand != brand_lower:
+            skipped += 1
+            continue
+        results.append(item)
         if len(results) >= top_n:
             break
 
     logger.info(
-        "brand=%s period=%s: captured_total=%d, this_brand=%d, skipped=%d",
-        brand_slug, period, len(seen_ids), len(results), skipped,
+        "brand=%s period=%s: extracted=%d, this_brand=%d, other_skipped=%d",
+        brand_slug, period, len(raw_items), len(results), skipped,
     )
     return results[:top_n]
