@@ -1,18 +1,11 @@
-"""ブランド独自ランキング スクレイパー v4。
-
-Playwrightでページを完全レンダリングした後、HTMLから複数パターンを試して
-商品データを抽出する。
-"""
+"""ブランド独自ランキング スクレイパー v5 - HTML DOM抽出 + 診断ダンプ。"""
 from __future__ import annotations
 
-import json as json_lib
 import logging
 import re
 import time
 
 from playwright.sync_api import sync_playwright
-
-from ..parser import find_goods_in_obj, extract_goods_list_from_html
 
 logger = logging.getLogger(__name__)
 
@@ -23,77 +16,83 @@ _USER_AGENT = (
 )
 
 
-def _extract_items_from_html(html: str, brand_slug: str) -> list[dict]:
-    """複数の埋め込みパターンを試してHTMLから商品データを抽出する。"""
-    # Strategy 1: const goodsList = "..." (既存パターン)
-    try:
-        items = extract_goods_list_from_html(html)
-        if items:
-            logger.info("brand=%s: Extracted %d items via goodsList pattern", brand_slug, len(items))
-            return items
-    except Exception:
-        pass
+def _dump_html_samples(html: str, brand_slug: str) -> None:
+    """goodsNo出現箇所の周辺を診断ダンプ。"""
+    positions = []
+    search_start = 0
+    while len(positions) < 3:
+        idx = html.find("goodsNo", search_start)
+        if idx < 0:
+            break
+        positions.append(idx)
+        search_start = idx + 1
 
-    # Strategy 2: <script id="__NEXT_DATA__"> (Next.js)
-    m = re.search(
-        r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
-        html, re.DOTALL,
-    )
-    if m:
-        try:
-            data = json_lib.loads(m.group(1))
-            items = find_goods_in_obj(data)
-            if items:
-                logger.info("brand=%s: Extracted %d items via __NEXT_DATA__", brand_slug, len(items))
-                return items
-        except Exception as e:
-            logger.debug("__NEXT_DATA__ parse failed: %s", e)
-
-    # Strategy 3: 任意の <script type="application/json"> から goods データ
-    for m in re.finditer(
-        r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>',
-        html, re.DOTALL,
-    ):
-        try:
-            data = json_lib.loads(m.group(1))
-            items = find_goods_in_obj(data)
-            if items:
-                logger.info(
-                    "brand=%s: Extracted %d items via application/json script",
-                    brand_slug, len(items),
-                )
-                return items
-        except Exception:
-            continue
-
-    # Strategy 4: window.__INITIAL_STATE__ など
-    for var_name in ["__INITIAL_STATE__", "__PRELOADED_STATE__", "__NUXT__", "__APOLLO_STATE__"]:
-        m = re.search(
-            rf'window\.{re.escape(var_name)}\s*=\s*(\{{.*?\}});?\s*</script>',
-            html, re.DOTALL,
+    for i, pos in enumerate(positions, 1):
+        start = max(0, pos - 200)
+        end = min(len(html), pos + 600)
+        sample = html[start:end].replace("\n", " ").replace("  ", " ")
+        logger.warning(
+            "[DIAG] brand=%s goodsNo #%d at offset=%d, total=%d:",
+            brand_slug, i, pos, len(html),
         )
-        if m:
-            try:
-                data = json_lib.loads(m.group(1))
-                items = find_goods_in_obj(data)
-                if items:
-                    logger.info(
-                        "brand=%s: Extracted %d items via window.%s",
-                        brand_slug, len(items), var_name,
-                    )
-                    return items
-            except Exception:
-                continue
+        # 250文字ずつ分割してログ
+        for j in range(0, len(sample), 250):
+            logger.warning("  %s", sample[j:j+250])
 
-    # Strategy 5: 最後の手段 - HTML 内のキーワードを報告
-    logger.warning(
-        "[DEBUG] brand=%s: No extraction strategy worked. HTML keyword presence:",
-        brand_slug,
+
+def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
+    """HTMLから商品データを抽出する(URLパターン中心)。"""
+    # /jp/goods/<数字> の出現順 = ランキング順
+    pattern = re.compile(r'/jp/goods/(\d+)')
+    seen: set[str] = set()
+    ordered_with_pos: list[tuple[str, int]] = []
+    for m in pattern.finditer(html):
+        gid = m.group(1)
+        if gid in seen:
+            continue
+        seen.add(gid)
+        ordered_with_pos.append((gid, m.start()))
+
+    logger.info(
+        "brand=%s: extracted %d unique goodsNo from URL patterns",
+        brand_slug, len(ordered_with_pos),
     )
-    for kw in ["__NEXT_DATA__", "goodsNo", "goodsInfoList", "goodsList", "brandId", "rankingList"]:
-        logger.warning("  '%s' in HTML: %s", kw, kw in html)
 
-    return []
+    if not ordered_with_pos:
+        return []
+
+    # 各商品の周辺HTMLから画像URLと価格を抽出
+    items = []
+    for gid, pos in ordered_with_pos:
+        # 各商品の周辺2500文字を切り出して属性を探す
+        section = html[pos:pos + 3000]
+
+        img_url = None
+        img_m = re.search(
+            r'<img[^>]+src=["\']([^"\']*image\.msscdn\.net[^"\']+)["\']',
+            section, re.IGNORECASE,
+        )
+        if img_m:
+            img_url = img_m.group(1)
+
+        price = None
+        price_m = re.search(r'¥\s*([\d,]+)', section)
+        if price_m:
+            try:
+                price = int(price_m.group(1).replace(",", ""))
+            except ValueError:
+                price = None
+
+        items.append({
+            "goodsNo": gid,
+            "brandId": brand_slug,
+            "brandName": brand_slug.upper(),
+            "imageUrl": img_url,
+            "price": price,
+            # 他のフィールドはNULL
+        })
+
+    return items
 
 
 def fetch_brand_ranking(
@@ -109,9 +108,7 @@ def fetch_brand_ranking(
     url = f"https://global.musinsa.com/jp/brands/{brand_slug}/trending?period={period}"
     logger.info("Loading brand page: brand=%s period=%s", brand_slug, period)
 
-    brand_lower = brand_slug.lower()
     html = ""
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -126,45 +123,31 @@ def fetch_brand_ranking(
         except Exception as e:
             logger.warning("page.goto: %s", e)
 
-        # JS実行待ち
         time.sleep(5)
 
-        # スクロールしてlazy-load発火
         for i in range(15):
             page.mouse.wheel(0, 5000)
             time.sleep(0.5)
 
-        # レンダリング後のHTMLを取得
         try:
             html = page.content()
-            logger.info("brand=%s: page HTML size=%d bytes", brand_slug, len(html))
         except Exception as e:
             logger.warning("page.content() failed: %s", e)
 
         browser.close()
 
-    # HTMLから商品データを抽出
-    raw_items = _extract_items_from_html(html, brand_slug)
+    logger.info("brand=%s: HTML size=%d bytes", brand_slug, len(html))
 
-    # 重複排除 + ブランドフィルタ
-    seen_ids: set[str] = set()
-    results: list[dict] = []
-    skipped = 0
-    for item in raw_items:
-        gid = str(item.get("goodsNo") or "")
-        if not gid or gid in seen_ids:
-            continue
-        seen_ids.add(gid)
-        item_brand = str(item.get("brandId") or "").lower()
-        if item_brand and item_brand != brand_lower:
-            skipped += 1
-            continue
-        results.append(item)
-        if len(results) >= top_n:
-            break
+    # 最初のブランド(mucent)の最初のperiod(weekly)時にHTMLサンプルをダンプ
+    # → 構造解析用の診断情報
+    if brand_slug.lower() == "mucent" and period == "weekly":
+        _dump_html_samples(html, brand_slug)
+
+    # HTML抽出
+    items = _extract_from_html(html, brand_slug)
 
     logger.info(
-        "brand=%s period=%s: extracted=%d, this_brand=%d, other_skipped=%d",
-        brand_slug, period, len(raw_items), len(results), skipped,
+        "brand=%s period=%s: returning %d items",
+        brand_slug, period, len(items),
     )
-    return results[:top_n]
+    return items[:top_n]
