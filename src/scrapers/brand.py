@@ -1,21 +1,20 @@
-"""ブランド独自ランキング スクレイパー (API直接アクセス版)。
+"""ブランド独自ランキング スクレイパー (Playwright版)。
 
-MUSINSAのトレンドAPIに brandIds パラメータを渡すことで、ブランド単位の
-weekly / monthly ランキングを取得する。Playwrightより圧倒的に高速。
+ブラウザで実際にブランドのtrendingページをロードして、
+サイトと同じ順位で表示されるデータを取得する。
 """
 from __future__ import annotations
 
 import logging
 import time
 
-import requests
+from playwright.sync_api import sync_playwright, Response
 
 from ..parser import find_goods_in_obj
 
 logger = logging.getLogger(__name__)
 
 
-_API_URL = "https://global.musinsa.com/api/global/trending/v2/items"
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -26,110 +25,99 @@ def fetch_brand_ranking(
     brand_slug: str,
     period: str = "weekly",
     top_n: int = 200,
-    timeout: int = 30,
+    timeout_ms: int = 60000,
     request_interval_seconds: float = 1.5,
 ) -> list[dict]:
-    """ブランドの weekly/monthly ランキング上位N件を取得する。
-
-    Args:
-        brand_slug: URLスラッグ (例: 'mucent')
-        period: 'weekly' または 'monthly'
-        top_n: 取得上位件数
-        timeout: HTTPタイムアウト(秒)
-        request_interval_seconds: ページ間のリクエスト間隔
-
-    Returns:
-        商品オブジェクト (MUSINSA API形式) のリスト
-    """
+    """ブランドの weekly/monthly ランキングをブラウザ経由で取得する。"""
     if period not in ("weekly", "monthly"):
         raise ValueError(f"period must be 'weekly' or 'monthly', got: {period}")
 
-    headers = {
-        "User-Agent": _USER_AGENT,
-        "Accept": "application/json",
-        "Accept-Language": "ja,en;q=0.9",
-        "Referer": f"https://global.musinsa.com/jp/brands/{brand_slug}/trending?period={period}",
-    }
+    url = f"https://global.musinsa.com/jp/brands/{brand_slug}/trending?period={period}"
+    logger.info("Loading brand page: brand=%s period=%s url=%s", brand_slug, period, url)
 
-    results: list[dict] = []
-    seen_ids: set[str] = set()
-    page = 1
+    captured: list[tuple[str, list[dict]]] = []
 
-    while len(results) < top_n:
-        params = {
-            "brandIds": brand_slug,
-            "period": period,
-            "gender": "F",
-            "page": page,
-            "size": 150,
-            "countryCode": "jp",
-            "toggleCountry": "jp",
-            "includeSoldout": "false",
-            "excludeComingSoonGoods": "true",
-        }
-        logger.info(
-            "brand=%s period=%s page=%d - fetching API",
-            brand_slug, period, page,
+    def on_response(response: Response) -> None:
+        try:
+            if response.request.resource_type not in ("fetch", "xhr"):
+                return
+            ct = response.headers.get("content-type", "")
+            if "application/json" not in ct:
+                return
+            # ブランドAPI or brandIds= を含むAPIのみ対象
+            url_lower = response.url.lower()
+            if (
+                f"/brands/{brand_slug.lower()}" not in url_lower
+                and f"brandids={brand_slug.lower()}" not in url_lower
+                and f"brand={brand_slug.lower()}" not in url_lower
+            ):
+                return
+            # period パラメータが含まれているかも確認 (順位の種類が違うAPIを除外)
+            if f"period={period}" not in url_lower and period not in url_lower:
+                # period条件無しのレスポンスは弱い候補なので、他に無ければ使う
+                pass
+            body = response.json()
+        except Exception:
+            return
+        items = find_goods_in_obj(body)
+        if items and len(items) >= 1:
+            captured.append((response.url, items))
+            logger.info(
+                "Captured %d items from %s",
+                len(items), response.url[:140],
+            )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=_USER_AGENT,
+            locale="ja-JP",
+            viewport={"width": 1280, "height": 1800},
         )
+        page = context.new_page()
+        page.on("response", on_response)
 
         try:
-            resp = requests.get(_API_URL, params=params, headers=headers, timeout=timeout)
-        except requests.RequestException as e:
-            logger.error("Request failed: %s", e)
-            raise
+            page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        except Exception as e:
+            logger.warning("page.goto: %s", e)
 
-        if resp.status_code != 200:
-            logger.error(
-                "API error: status=%d url=%s body=%s",
-                resp.status_code, resp.url, resp.text[:500],
-            )
-            resp.raise_for_status()
+        # スクロールで遅延ロード発火
+        prev_count = 0
+        for i in range(40):
+            page.mouse.wheel(0, 5000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=4000)
+            except Exception:
+                pass
+            time.sleep(0.7)
+            current_count = sum(len(items) for _, items in captured)
+            if current_count >= top_n:
+                break
+            if current_count == prev_count and i > 5:
+                logger.info("No new items after scroll %d, stopping", i)
+                break
+            prev_count = current_count
 
-        try:
-            data = resp.json()
-        except ValueError as e:
-            logger.error(
-                "JSON decode failed for brand=%s period=%s: %s, body=%s",
-                brand_slug, period, e, resp.text[:500],
-            )
-            break
+        browser.close()
 
-        items = find_goods_in_obj(data) or []
-        if not items:
-            logger.warning(
-                "brand=%s period=%s page=%d: no goods items in response",
-                brand_slug, period, page,
-            )
-            if isinstance(data, dict):
-                logger.info("Top-level response keys: %s", list(data.keys())[:15])
-            break
-
-        added = 0
+    # 受信順に重複排除 = サイト表示順 = ランキング順
+    seen_ids: set[str] = set()
+    results: list[dict] = []
+    for resp_url, items in captured:
         for item in items:
             gid = str(item.get("goodsNo") or "")
             if not gid or gid in seen_ids:
                 continue
             seen_ids.add(gid)
             results.append(item)
-            added += 1
             if len(results) >= top_n:
                 break
-
-        logger.info(
-            "brand=%s period=%s page=%d: added %d items (total=%d)",
-            brand_slug, period, page, added, len(results),
-        )
-
-        if added == 0:
-            # 同じ商品しか返ってこなくなった = 最終ページ
+        if len(results) >= top_n:
             break
 
-        page += 1
-        if len(results) < top_n:
-            time.sleep(request_interval_seconds)
-
     logger.info(
-        "brand=%s period=%s: returning %d items",
-        brand_slug, period, len(results),
+        "brand=%s period=%s: collected %d, returning top %d",
+        brand_slug, period, len(results), min(top_n, len(results)),
     )
     return results[:top_n]
