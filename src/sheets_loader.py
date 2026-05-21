@@ -1,86 +1,135 @@
-"""Googleスプレッドシートへのデータ追記。
+"""ブランド独自ランキング スクレイパー (API直接アクセス版)。
 
-ranking_type ごとに別シート(overall / brand_weekly / brand_monthly)に追記する。
+MUSINSAのトレンドAPIに brandIds パラメータを渡すことで、ブランド単位の
+weekly / monthly ランキングを取得する。Playwrightより圧倒的に高速。
 """
 from __future__ import annotations
 
 import logging
-import os
-from typing import Iterable
+import time
 
-import gspread
+import requests
+
+from ..parser import find_goods_in_obj
 
 logger = logging.getLogger(__name__)
 
 
-# BigQueryのカラム順と一致させる
-_COLUMNS = [
-    "date_key",
-    "ranking_type",
-    "brand_name",
-    "brand_id",
-    "rank",
-    "product_id",
-    "product_name",
-    "category",
-    "image_url",
-    "price",
-    "normal_price",
-    "sale_rate",
-    "favorite_count",
-    "listing_date",
-    "product_url",
-    "product_brand_name",
-    "product_brand_id",
-    "scraped_at",
-]
+_API_URL = "https://global.musinsa.com/api/global/trending/v2/items"
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 
-def _row_to_list(row: dict) -> list:
-    return [row.get(c) if row.get(c) is not None else "" for c in _COLUMNS]
+def fetch_brand_ranking(
+    brand_slug: str,
+    period: str = "weekly",
+    top_n: int = 200,
+    timeout: int = 30,
+    request_interval_seconds: float = 1.5,
+) -> list[dict]:
+    """ブランドの weekly/monthly ランキング上位N件を取得する。
 
+    Args:
+        brand_slug: URLスラッグ (例: 'mucent')
+        period: 'weekly' または 'monthly'
+        top_n: 取得上位件数
+        timeout: HTTPタイムアウト(秒)
+        request_interval_seconds: ページ間のリクエスト間隔
 
-def _ensure_worksheet(sh: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
-    try:
-        ws = sh.worksheet(title)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows=1000, cols=len(_COLUMNS))
-        ws.append_row(_COLUMNS, value_input_option="RAW")
-        return ws
-    # ヘッダー行が無ければ追加
-    first_row = ws.row_values(1)
-    if not first_row:
-        ws.append_row(_COLUMNS, value_input_option="RAW")
-    return ws
-
-
-def load_rows_to_sheets(
-    rows: Iterable[dict],
-    spreadsheet_id: str | None = None,
-) -> None:
-    """共通スキーマの行リストをGoogleスプレッドシートに追記する。
-
-    ranking_type ごとに別シートに振り分ける。
+    Returns:
+        商品オブジェクト (MUSINSA API形式) のリスト
     """
-    rows_list = list(rows)
-    if not rows_list:
-        logger.info("No rows to load to Sheets, skipping")
-        return
+    if period not in ("weekly", "monthly"):
+        raise ValueError(f"period must be 'weekly' or 'monthly', got: {period}")
 
-    spreadsheet_id = spreadsheet_id or os.environ.get("GSHEETS_SPREADSHEET_ID")
-    if not spreadsheet_id:
-        raise RuntimeError("Spreadsheet ID not specified (set GSHEETS_SPREADSHEET_ID env var)")
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Language": "ja,en;q=0.9",
+        "Referer": f"https://global.musinsa.com/jp/brands/{brand_slug}/trending?period={period}",
+    }
 
-    gc = gspread.service_account()  # GOOGLE_APPLICATION_CREDENTIALS を参照
-    sh = gc.open_by_key(spreadsheet_id)
+    results: list[dict] = []
+    seen_ids: set[str] = set()
+    page = 1
 
-    # ranking_type ごとにグループ化
-    by_type: dict[str, list[dict]] = {}
-    for r in rows_list:
-        by_type.setdefault(r.get("ranking_type", "unknown"), []).append(r)
+    while len(results) < top_n:
+        params = {
+            "brandIds": brand_slug,
+            "period": period,
+            "gender": "F",
+            "page": page,
+            "size": 150,
+            "countryCode": "jp",
+            "toggleCountry": "jp",
+            "includeSoldout": "false",
+            "excludeComingSoonGoods": "true",
+        }
+        logger.info(
+            "brand=%s period=%s page=%d - fetching API",
+            brand_slug, period, page,
+        )
 
-    for rtype, group in by_type.items():
-        ws = _ensure_worksheet(sh, rtype)
-        values = [_row_to_list(r) for r in group]
-        ws.append_rows(values, value_input_option="RAW")
-        logger.info("Appended %d rows to sheet '%s'", len(values), rtype)
+        try:
+            resp = requests.get(_API_URL, params=params, headers=headers, timeout=timeout)
+        except requests.RequestException as e:
+            logger.error("Request failed: %s", e)
+            raise
+
+        if resp.status_code != 200:
+            logger.error(
+                "API error: status=%d url=%s body=%s",
+                resp.status_code, resp.url, resp.text[:500],
+            )
+            resp.raise_for_status()
+
+        try:
+            data = resp.json()
+        except ValueError as e:
+            logger.error(
+                "JSON decode failed for brand=%s period=%s: %s, body=%s",
+                brand_slug, period, e, resp.text[:500],
+            )
+            break
+
+        items = find_goods_in_obj(data) or []
+        if not items:
+            logger.warning(
+                "brand=%s period=%s page=%d: no goods items in response",
+                brand_slug, period, page,
+            )
+            if isinstance(data, dict):
+                logger.info("Top-level response keys: %s", list(data.keys())[:15])
+            break
+
+        added = 0
+        for item in items:
+            gid = str(item.get("goodsNo") or "")
+            if not gid or gid in seen_ids:
+                continue
+            seen_ids.add(gid)
+            results.append(item)
+            added += 1
+            if len(results) >= top_n:
+                break
+
+        logger.info(
+            "brand=%s period=%s page=%d: added %d items (total=%d)",
+            brand_slug, period, page, added, len(results),
+        )
+
+        if added == 0:
+            # 同じ商品しか返ってこなくなった = 最終ページ
+            break
+
+        page += 1
+        if len(results) < top_n:
+            time.sleep(request_interval_seconds)
+
+    logger.info(
+        "brand=%s period=%s: returning %d items",
+        brand_slug, period, len(results),
+    )
+    return results[:top_n]
