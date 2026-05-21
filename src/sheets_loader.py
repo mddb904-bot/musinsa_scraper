@@ -13,26 +13,12 @@ import gspread
 logger = logging.getLogger(__name__)
 
 
-# BigQueryのカラム順と一致させる
 _COLUMNS = [
-    "date_key",
-    "ranking_type",
-    "brand_name",
-    "brand_id",
-    "rank",
-    "product_id",
-    "product_name",
-    "category",
-    "image_url",
-    "price",
-    "normal_price",
-    "sale_rate",
-    "favorite_count",
-    "listing_date",
-    "product_url",
-    "product_brand_name",
-    "product_brand_id",
-    "scraped_at",
+    "date_key", "ranking_type", "brand_name", "brand_id", "rank",
+    "product_id", "product_name", "category", "image_url",
+    "price", "normal_price", "sale_rate", "favorite_count",
+    "listing_date", "product_url", "product_brand_name",
+    "product_brand_id", "scraped_at",
 ]
 
 
@@ -54,7 +40,6 @@ def _ensure_worksheet(sh: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
 
 
 def _get_gspread_client() -> gspread.Client:
-    """GOOGLE_APPLICATION_CREDENTIALS 環境変数からサービスアカウントキーのパスを取得して認証する。"""
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path and os.path.exists(creds_path):
         logger.info("Authenticating gspread with key file: %s", creds_path)
@@ -67,7 +52,6 @@ def load_rows_to_sheets(
     rows: Iterable[dict],
     spreadsheet_id: str | None = None,
 ) -> None:
-    """共通スキーマの行リストをGoogleスプレッドシートに追記する。"""
     rows_list = list(rows)
     if not rows_list:
         logger.info("No rows to load to Sheets, skipping")
@@ -79,6 +63,12 @@ def load_rows_to_sheets(
 
     gc = _get_gspread_client()
     sh = gc.open_by_key(spreadsheet_id)
+
+    # 書き込み先スプシのタイトルとURLをログに出す (デバッグ用)
+    logger.info(
+        "Writing to spreadsheet: title='%s' url='%s'",
+        sh.title, sh.url,
+    )
 
     by_type: dict[str, list[dict]] = {}
     for r in rows_list:
