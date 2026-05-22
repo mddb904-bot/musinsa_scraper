@@ -1,4 +1,4 @@
-"""ブランド独自ランキング スクレイパー v9 - data-goods-nm 対応 + 完全診断ダンプ。"""
+"""ブランド独自ランキング スクレイパー v10 - data-product-id 境界方式。"""
 from __future__ import annotations
 
 import logging
@@ -17,173 +17,84 @@ _USER_AGENT = (
 
 
 def _extract_image_url(section: str) -> str | None:
-    for attr in ["src", "data-src", "data-original", "data-lazy-src", "data-original-src"]:
+    for attr in ["src", "data-src", "data-original", "data-lazy-src"]:
         m = re.search(
             rf'<img[^>]+\b{attr}=["\']([^"\']*image\.msscdn\.net[^"\']+)["\']',
             section, re.IGNORECASE,
         )
         if m:
             return m.group(1)
-    m = re.search(
-        r'srcset=["\']([^"\']*image\.msscdn\.net[^"\']+)',
-        section, re.IGNORECASE,
-    )
+    m = re.search(r'srcset=["\']([^"\']*image\.msscdn\.net[^"\']+)', section, re.IGNORECASE)
     if m:
         return m.group(1).split(" ")[0].split(",")[0]
-    m = re.search(
-        r'["\']([^"\']*image\.msscdn\.net/[^"\']+\.(?:jpg|jpeg|png|webp))["\']',
-        section, re.IGNORECASE,
-    )
-    if m:
-        return m.group(1)
     return None
 
 
-def _extract_name(section: str) -> str | None:
-    # 1. MUSINSAの実際の属性: data-goods-nm が最優先
-    m = re.search(r'data-goods-nm=["\']([^"\']+)["\']', section)
-    if m:
-        v = m.group(1).strip()
-        if v and len(v) < 200:
-            return v
-    # 2. <img alt="..."> の "undefined_" プレフィックスを除去
-    m = re.search(r'<img[^>]+alt=["\']([^"\']+)["\']', section, re.IGNORECASE)
-    if m:
-        v = m.group(1).strip()
-        if v.startswith("undefined_"):
-            v = v[len("undefined_"):].strip()
-        if v and len(v) < 200:
-            return v
-    # 3. その他フォールバック
-    for pat in [
-        r'data-goods-name=["\']([^"\']+)["\']',
-        r'data-name=["\']([^"\']+)["\']',
-        r'data-product-name=["\']([^"\']+)["\']',
-    ]:
-        m = re.search(pat, section, re.IGNORECASE)
-        if m:
-            v = m.group(1).strip()
-            if v and len(v) < 200:
-                return v
-    return None
-
-
-def _extract_prices(section: str) -> tuple[int | None, int | None, int | None]:
-    price = None
-    normal_price = None
-    sale_rate = None
-    price_matches = re.findall(r'¥\s*([\d,]+)', section)
-    if price_matches:
-        try:
-            price = int(price_matches[-1].replace(",", ""))
-            normal_price = (
-                int(price_matches[0].replace(",", ""))
-                if len(price_matches) >= 2 else price
-            )
-        except ValueError:
-            pass
-    if price is None:
-        for pat in [r'data-price=["\']?(\d+)', r'data-sale-price=["\']?(\d+)']:
-            m = re.search(pat, section)
-            if m:
-                try:
-                    price = int(m.group(1))
-                    break
-                except ValueError:
-                    continue
-    rate_m = re.search(r'(\d{1,2})\s*%(?:\s*OFF)?', section)
-    if rate_m:
-        try:
-            v = int(rate_m.group(1))
-            if 0 < v < 100:
-                sale_rate = v
-        except ValueError:
-            pass
-    return price, normal_price, sale_rate
-
-
-def _extract_like_count(section: str) -> int | None:
-    for pat in [
-        r'data-like-count=["\']?(\d+)',
-        r'data-favorite-count=["\']?(\d+)',
-        r'data-likes=["\']?(\d+)',
-        r'"likeCount"\s*:\s*(\d+)',
-        r'"favoriteCount"\s*:\s*(\d+)',
-        r'aria-label=["\']?(?:いいね|お気に入り|likes?)[^"\']*?(\d+)',
-        r'[♡♥❤]\s*([\d,]+)',
-        # 追加: GTM クラス や like/wish/favorite クラスの近く
-        r'class="[^"]*(?:like|wish|favorite)[-_]?(?:count|num)[^"]*"[^>]*>([\d,]+)',
-        r'gtm-like[^>]*>([\d,]+)',
-    ]:
-        m = re.search(pat, section, re.IGNORECASE)
-        if m:
-            try:
-                v = m.group(1).replace(",", "")
-                return int(v)
-            except ValueError:
-                continue
-    return None
+def _safe_int(s: str | None) -> int | None:
+    if not s:
+        return None
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        return None
 
 
 def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
-    pattern = re.compile(r'data-goods-no=["\'](\d+)["\']')
+    """<li data-product-id="N"> 要素の属性から商品データを抽出する。
+
+    MUSINSAのHTML構造:
+    <li data-product-id="N" data-product-name="..." data-like-count="X"
+        data-price="Y" data-original-price="Z" data-discount-rate="W"
+        data-index="ランク" ...>
+      <div>
+        <img src="画像URL"> ... (li ボディ)
+      </div>
+    </li>
+    """
     seen: set[str] = set()
-    ordered: list[tuple[str, int]] = []
-    for m in pattern.finditer(html):
+    products: list[dict] = []
+
+    for m in re.finditer(r'\bdata-product-id=["\'](\d+)["\']', html):
         gid = m.group(1)
         if gid in seen:
             continue
         seen.add(gid)
-        ordered.append((gid, m.start()))
+        pos = m.start()
 
-    if not ordered:
-        for m in re.finditer(r'/jp/goods/(\d+)', html):
-            gid = m.group(1)
-            if gid in seen:
-                continue
-            seen.add(gid)
-            ordered.append((gid, m.start()))
+        # data-product-id の前にある <li ... を逆方向検索
+        li_start = -1
+        for tag in ['<li ', '<li\t', '<li\n', '<li\r']:
+            found = html.rfind(tag, max(0, pos - 3000), pos)
+            if found > li_start:
+                li_start = found
+        if li_start < 0:
+            continue
 
-    logger.info("brand=%s: found %d product positions", brand_slug, len(ordered))
+        # <li> 開始タグの末尾 > を検索
+        gt_pos = html.find('>', pos)
+        if gt_pos < 0:
+            continue
 
-    if not ordered:
-        return []
+        li_opening = html[li_start:gt_pos + 1]
 
-    # mucent の最初の商品セクションを「全部」ダンプ(構造確認用)
-    if brand_slug.lower() == "mucent" and len(ordered) >= 2:
-        first_gid, first_pos = ordered[0]
-        first_section = html[first_pos:ordered[1][1]]
-        logger.warning(
-            "[DIAG] brand=%s FULL first product section (gid=%s, total=%d chars):",
-            brand_slug, first_gid, len(first_section),
-        )
-        clean = first_section.replace("\n", " ")
-        for j in range(0, len(clean), 250):
-            logger.warning("  [%d] %s", j, clean[j:j + 250])
+        def _a(pattern: str) -> str | None:
+            r = re.search(pattern, li_opening)
+            return r.group(1) if r else None
 
-    items = []
-    missing_stats = {"name": 0, "image": 0, "price": 0, "like": 0}
-    for i, (gid, pos) in enumerate(ordered):
-        if i + 1 < len(ordered):
-            section = html[pos:ordered[i + 1][1]]
-        else:
-            section = html[pos:pos + 5000]
+        name = _a(r'data-product-name=["\']([^"\']+)["\']')
+        like_count = _safe_int(_a(r'data-like-count=["\'](\d+)["\']'))
+        price = _safe_int(_a(r'data-price=["\'](\d+)["\']'))
+        normal_price = _safe_int(_a(r'data-original-price=["\'](\d+)["\']'))
+        sale_rate = _safe_int(_a(r'data-discount-rate=["\'](\d+)["\']'))
+        rank_index = _safe_int(_a(r'data-index=["\'](\d+)["\']'))
 
-        name = _extract_name(section)
-        img_url = _extract_image_url(section)
-        price, normal_price, sale_rate = _extract_prices(section)
-        like_count = _extract_like_count(section)
+        # <li> ボディから画像URLを取得
+        next_li_m = re.search(r'<li[\s>]', html[gt_pos + 1:gt_pos + 7000])
+        body_end = gt_pos + 1 + next_li_m.start() if next_li_m else gt_pos + 6000
+        li_body = html[gt_pos + 1:body_end]
+        img_url = _extract_image_url(li_body)
 
-        if not name:
-            missing_stats["name"] += 1
-        if not img_url:
-            missing_stats["image"] += 1
-        if price is None:
-            missing_stats["price"] += 1
-        if like_count is None:
-            missing_stats["like"] += 1
-
-        items.append({
+        products.append({
             "goodsNo": gid,
             "goodsName": name,
             "brandId": brand_slug,
@@ -194,17 +105,26 @@ def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
             "saleRate": sale_rate,
             "likeCount": like_count,
             "landingUrl": f"/jp/goods/{gid}",
+            "_rank_index": rank_index if rank_index is not None else 9999,
         })
 
-    total = len(items)
-    logger.info(
-        "brand=%s: extraction stats out of %d - missing: name=%d, image=%d, price=%d, like=%d",
-        brand_slug, total,
-        missing_stats["name"], missing_stats["image"],
-        missing_stats["price"], missing_stats["like"],
-    )
+    # ランク順にソート
+    products.sort(key=lambda x: x["_rank_index"])
+    for p in products:
+        p.pop("_rank_index", None)
 
-    return items
+    total = len(products)
+    missing = {
+        k: sum(1 for p in products if not p.get(k))
+        for k in ("goodsName", "imageUrl", "price", "likeCount")
+    }
+    logger.info(
+        "brand=%s: extracted %d products. missing: name=%d, image=%d, price=%d, like=%d",
+        brand_slug, total,
+        missing["goodsName"], missing["imageUrl"],
+        missing.get("price", 0), missing["likeCount"],
+    )
+    return products
 
 
 def fetch_brand_ranking(
@@ -245,8 +165,5 @@ def fetch_brand_ranking(
 
     logger.info("brand=%s: HTML size=%d bytes", brand_slug, len(html))
     items = _extract_from_html(html, brand_slug)
-    logger.info(
-        "brand=%s period=%s: returning %d items",
-        brand_slug, period, len(items),
-    )
+    logger.info("brand=%s period=%s: returning %d items", brand_slug, period, len(items))
     return items[:top_n]
