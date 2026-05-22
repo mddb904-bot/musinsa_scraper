@@ -1,7 +1,6 @@
-"""Googleスプレッドシートへの追記(スマート追記版)。
+"""Googleスプレッドシートへの追記(B列スタート版)。
 
-最後にデータが入っている行を探して、その次から書き込む。
-手動でデータを消した場合も、消された後に正しく続きを書く。
+A列はユーザーが画像数式等を入れる予約列。データは B列から書き込む。
 """
 from __future__ import annotations
 
@@ -22,17 +21,28 @@ _COLUMNS = [
     "product_brand_id", "scraped_at",
 ]
 
+# データ書き込み開始列 (B=2, A列はユーザー予約)
+_DATA_COL_START = 2
+
 
 def _row_to_list(row: dict) -> list:
     return [row.get(c) if row.get(c) is not None else "" for c in _COLUMNS]
 
 
+def _end_col_letter() -> str:
+    """データ終了列の英字 (B から 18列 = S) を返す。"""
+    return gspread.utils.rowcol_to_a1(
+        1, _DATA_COL_START + len(_COLUMNS) - 1
+    ).rstrip("0123456789")
+
+
 def _find_last_data_row(ws: gspread.Worksheet) -> int:
-    """データが入っている最後の行番号(1-indexed)を返す。空なら0。"""
+    """B列以降にデータが入っている最後の行番号(1-indexed)を返す。A列は無視。"""
     all_values = ws.get_all_values()
     last = 0
     for i, row in enumerate(all_values):
-        if any(c.strip() for c in row):
+        # B列 (index 1) 以降にデータがあるか
+        if len(row) > 1 and any(c.strip() for c in row[1:]):
             last = i + 1
     return last
 
@@ -42,37 +52,35 @@ def _smart_append(
     header: list[str],
     rows_values: list[list],
 ) -> int:
-    """ヘッダーを保証しつつ、最後のデータ行の次から書き込む。"""
+    """B列からヘッダーと値をスマートに追記する。A列はユーザー予約。"""
     last_row = _find_last_data_row(ws)
+    end_col = _end_col_letter()
 
     if last_row == 0:
-        # シートが空: ヘッダーを書いてから データ書き込み
-        logger.info("Sheet '%s' is empty, writing header at A1", ws.title)
-        ws.update("A1", [header], value_input_option="RAW")
+        # 空シート: B1にヘッダー書き込み
+        logger.info("Sheet '%s' is empty, writing header at B1", ws.title)
+        ws.update(f"B1:{end_col}1", [header], value_input_option="RAW")
         start_row = 2
     else:
-        # ヘッダー(1行目)を確認
-        first_row = ws.row_values(1)
-        if first_row != header:
+        # B1 のヘッダーを確認
+        row_1 = ws.row_values(1)
+        current_header = row_1[1:1 + len(header)] if len(row_1) > 1 else []
+        if current_header != header:
             logger.warning(
-                "Sheet '%s' header mismatch, overwriting row 1",
-                ws.title,
+                "Sheet '%s' header mismatch in B1, overwriting", ws.title,
             )
-            ws.update("A1", [header], value_input_option="RAW")
+            ws.update(f"B1:{end_col}1", [header], value_input_option="RAW")
         start_row = max(last_row + 1, 2)
 
     if not rows_values:
         return 0
 
     num_rows = len(rows_values)
-    num_cols = len(header)
     end_row = start_row + num_rows - 1
-    end_col_a1 = gspread.utils.rowcol_to_a1(1, num_cols).rstrip("0123456789")
-    range_str = f"A{start_row}:{end_col_a1}{end_row}"
-
+    range_str = f"B{start_row}:{end_col}{end_row}"
     ws.update(range_str, rows_values, value_input_option="RAW")
     logger.info(
-        "Wrote %d rows to sheet '%s' (range: %s)",
+        "Wrote %d rows to sheet '%s' (range: %s, column A reserved for user)",
         num_rows, ws.title, range_str,
     )
     return num_rows
@@ -83,7 +91,10 @@ def _ensure_worksheet(sh: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
         return sh.worksheet(title)
     except gspread.WorksheetNotFound:
         logger.info("Creating new worksheet: '%s'", title)
-        return sh.add_worksheet(title=title, rows=2000, cols=len(_COLUMNS))
+        # A列 + データ列 分のカラム数
+        return sh.add_worksheet(
+            title=title, rows=2000, cols=len(_COLUMNS) + 1,
+        )
 
 
 def _get_gspread_client() -> gspread.Client:
