@@ -153,18 +153,27 @@ def fetch_brand_ranking(
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         except Exception as e:
             logger.warning("page.goto: %s", e)
-        time.sleep(5)
-        for i in range(20):
-            page.mouse.wheel(0, 2000)  # 小さいスクロール幅で確実に
-            time.sleep(1.5)            # React描画待ち
-        # スクロール後、追加で描画を待つ
+        time.sleep(3)
+        # JS でページ内をゆっくりスクロール → React の遅延レンダリングを確実に発火
         try:
-            page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass
+            page.evaluate("""
+                async () => {
+                    const delay = ms => new Promise(r => setTimeout(r, ms));
+                    const totalHeight = document.body.scrollHeight;
+                    const step = 400;
+                    for (let pos = 0; pos <= totalHeight + step; pos += step) {
+                        window.scrollTo(0, pos);
+                        await delay(150);
+                    }
+                    await delay(2000);
+                }
+            """)
+        except Exception as e:
+            # フォールバック: マウスホイール方式
+            for i in range(25):
+                page.mouse.wheel(0, 1500)
+                time.sleep(2.0)
         time.sleep(2)
-        try:
-            html = page.content()
         except Exception as e:
             logger.warning("page.content() failed: %s", e)
         browser.close()
