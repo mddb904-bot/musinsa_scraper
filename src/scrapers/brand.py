@@ -1,4 +1,4 @@
-"""ブランド独自ランキング スクレイパー v8 - 歯抜け対策強化版。"""
+"""ブランド独自ランキング スクレイパー v9 - data-goods-nm 対応 + 完全診断ダンプ。"""
 from __future__ import annotations
 
 import logging
@@ -17,8 +17,6 @@ _USER_AGENT = (
 
 
 def _extract_image_url(section: str) -> str | None:
-    """商品画像URLを複数パターンで探す。"""
-    # 様々な属性名を試す (lazy loading 対応)
     for attr in ["src", "data-src", "data-original", "data-lazy-src", "data-original-src"]:
         m = re.search(
             rf'<img[^>]+\b{attr}=["\']([^"\']*image\.msscdn\.net[^"\']+)["\']',
@@ -26,14 +24,12 @@ def _extract_image_url(section: str) -> str | None:
         )
         if m:
             return m.group(1)
-    # srcset: "url1 1x, url2 2x" 形式から最初のURLを取る
     m = re.search(
         r'srcset=["\']([^"\']*image\.msscdn\.net[^"\']+)',
         section, re.IGNORECASE,
     )
     if m:
         return m.group(1).split(" ")[0].split(",")[0]
-    # 任意の image.msscdn.net URL を最終手段で探す
     m = re.search(
         r'["\']([^"\']*image\.msscdn\.net/[^"\']+\.(?:jpg|jpeg|png|webp))["\']',
         section, re.IGNORECASE,
@@ -44,30 +40,38 @@ def _extract_image_url(section: str) -> str | None:
 
 
 def _extract_name(section: str) -> str | None:
-    """商品名を複数パターンで探す。"""
+    # 1. MUSINSAの実際の属性: data-goods-nm が最優先
+    m = re.search(r'data-goods-nm=["\']([^"\']+)["\']', section)
+    if m:
+        v = m.group(1).strip()
+        if v and len(v) < 200:
+            return v
+    # 2. <img alt="..."> の "undefined_" プレフィックスを除去
+    m = re.search(r'<img[^>]+alt=["\']([^"\']+)["\']', section, re.IGNORECASE)
+    if m:
+        v = m.group(1).strip()
+        if v.startswith("undefined_"):
+            v = v[len("undefined_"):].strip()
+        if v and len(v) < 200:
+            return v
+    # 3. その他フォールバック
     for pat in [
         r'data-goods-name=["\']([^"\']+)["\']',
         r'data-name=["\']([^"\']+)["\']',
         r'data-product-name=["\']([^"\']+)["\']',
-        r'<img[^>]+alt=["\']([^"\']+)["\']',
-        r'<p[^>]*class="[^"]*(?:goods|product)[-_]?name[^"]*"[^>]*>([^<]+)</p>',
-        r'<span[^>]*class="[^"]*(?:goods|product)[-_]?name[^"]*"[^>]*>([^<]+)</span>',
     ]:
         m = re.search(pat, section, re.IGNORECASE)
         if m:
             v = m.group(1).strip()
-            if v and len(v) < 200 and not v.startswith("¥"):
+            if v and len(v) < 200:
                 return v
     return None
 
 
 def _extract_prices(section: str) -> tuple[int | None, int | None, int | None]:
-    """(price, normal_price, sale_rate) を返す。"""
     price = None
     normal_price = None
     sale_rate = None
-
-    # ¥xxx を全て探す
     price_matches = re.findall(r'¥\s*([\d,]+)', section)
     if price_matches:
         try:
@@ -78,8 +82,6 @@ def _extract_prices(section: str) -> tuple[int | None, int | None, int | None]:
             )
         except ValueError:
             pass
-
-    # フォールバック: data-price 属性
     if price is None:
         for pat in [r'data-price=["\']?(\d+)', r'data-sale-price=["\']?(\d+)']:
             m = re.search(pat, section)
@@ -89,8 +91,6 @@ def _extract_prices(section: str) -> tuple[int | None, int | None, int | None]:
                     break
                 except ValueError:
                     continue
-
-    # セール率
     rate_m = re.search(r'(\d{1,2})\s*%(?:\s*OFF)?', section)
     if rate_m:
         try:
@@ -99,20 +99,21 @@ def _extract_prices(section: str) -> tuple[int | None, int | None, int | None]:
                 sale_rate = v
         except ValueError:
             pass
-
     return price, normal_price, sale_rate
 
 
 def _extract_like_count(section: str) -> int | None:
-    """お気に入り数を複数パターンで探す。"""
     for pat in [
         r'data-like-count=["\']?(\d+)',
         r'data-favorite-count=["\']?(\d+)',
-        r'data-likes?=["\']?(\d+)',
+        r'data-likes=["\']?(\d+)',
         r'"likeCount"\s*:\s*(\d+)',
         r'"favoriteCount"\s*:\s*(\d+)',
         r'aria-label=["\']?(?:いいね|お気に入り|likes?)[^"\']*?(\d+)',
         r'[♡♥❤]\s*([\d,]+)',
+        # 追加: GTM クラス や like/wish/favorite クラスの近く
+        r'class="[^"]*(?:like|wish|favorite)[-_]?(?:count|num)[^"]*"[^>]*>([\d,]+)',
+        r'gtm-like[^>]*>([\d,]+)',
     ]:
         m = re.search(pat, section, re.IGNORECASE)
         if m:
@@ -125,7 +126,6 @@ def _extract_like_count(section: str) -> int | None:
 
 
 def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
-    """HTMLから商品データを抽出する。"""
     pattern = re.compile(r'data-goods-no=["\'](\d+)["\']')
     seen: set[str] = set()
     ordered: list[tuple[str, int]] = []
@@ -149,17 +149,17 @@ def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
     if not ordered:
         return []
 
-    # 初回(mucent)だけ、最初の商品セクションをログに出して構造確認
+    # mucent の最初の商品セクションを「全部」ダンプ(構造確認用)
     if brand_slug.lower() == "mucent" and len(ordered) >= 2:
         first_gid, first_pos = ordered[0]
         first_section = html[first_pos:ordered[1][1]]
         logger.warning(
-            "[DIAG] brand=%s first product section (gid=%s, %d chars):",
+            "[DIAG] brand=%s FULL first product section (gid=%s, total=%d chars):",
             brand_slug, first_gid, len(first_section),
         )
         clean = first_section.replace("\n", " ")
-        for j in range(0, min(len(clean), 2400), 250):
-            logger.warning("  %s", clean[j:j + 250])
+        for j in range(0, len(clean), 250):
+            logger.warning("  [%d] %s", j, clean[j:j + 250])
 
     items = []
     missing_stats = {"name": 0, "image": 0, "price": 0, "like": 0}
@@ -196,7 +196,6 @@ def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
             "landingUrl": f"/jp/goods/{gid}",
         })
 
-    # 抽出失敗の統計をログに
     total = len(items)
     logger.info(
         "brand=%s: extraction stats out of %d - missing: name=%d, image=%d, price=%d, like=%d",
@@ -230,28 +229,22 @@ def fetch_brand_ranking(
             viewport={"width": 1280, "height": 1800},
         )
         page = context.new_page()
-
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         except Exception as e:
             logger.warning("page.goto: %s", e)
-
         time.sleep(5)
         for i in range(15):
             page.mouse.wheel(0, 5000)
             time.sleep(0.5)
-
         try:
             html = page.content()
         except Exception as e:
             logger.warning("page.content() failed: %s", e)
-
         browser.close()
 
     logger.info("brand=%s: HTML size=%d bytes", brand_slug, len(html))
-
     items = _extract_from_html(html, brand_slug)
-
     logger.info(
         "brand=%s period=%s: returning %d items",
         brand_slug, period, len(items),
