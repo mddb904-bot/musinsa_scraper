@@ -40,17 +40,6 @@ def _safe_int(s: str | None) -> int | None:
 
 
 def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
-    """<li data-product-id="N"> 要素の属性から商品データを抽出する。
-
-    MUSINSAのHTML構造:
-    <li data-product-id="N" data-product-name="..." data-like-count="X"
-        data-price="Y" data-original-price="Z" data-discount-rate="W"
-        data-index="ランク" ...>
-      <div>
-        <img src="画像URL"> ... (li ボディ)
-      </div>
-    </li>
-    """
     seen: set[str] = set()
     products: list[dict] = []
 
@@ -61,7 +50,6 @@ def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
         seen.add(gid)
         pos = m.start()
 
-        # data-product-id の前にある <li ... を逆方向検索
         li_start = -1
         for tag in ['<li ', '<li\t', '<li\n', '<li\r']:
             found = html.rfind(tag, max(0, pos - 3000), pos)
@@ -70,7 +58,6 @@ def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
         if li_start < 0:
             continue
 
-        # <li> 開始タグの末尾 > を検索
         gt_pos = html.find('>', pos)
         if gt_pos < 0:
             continue
@@ -88,7 +75,6 @@ def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
         sale_rate = _safe_int(_a(r'data-discount-rate=["\'](\d+)["\']'))
         rank_index = _safe_int(_a(r'data-index=["\'](\d+)["\']'))
 
-        # <li> ボディから画像URLを取得
         next_li_m = re.search(r'<li[\s>]', html[gt_pos + 1:gt_pos + 7000])
         body_end = gt_pos + 1 + next_li_m.start() if next_li_m else gt_pos + 6000
         li_body = html[gt_pos + 1:body_end]
@@ -108,7 +94,6 @@ def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
             "_rank_index": rank_index if rank_index is not None else 9999,
         })
 
-    # ランク順にソート
     products.sort(key=lambda x: x["_rank_index"])
     for p in products:
         p.pop("_rank_index", None)
@@ -153,7 +138,9 @@ def fetch_brand_ranking(
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         except Exception as e:
             logger.warning("page.goto: %s", e)
+
         time.sleep(3)
+
         # JS でページ内をゆっくりスクロール → React の遅延レンダリングを確実に発火
         try:
             page.evaluate("""
@@ -169,13 +156,18 @@ def fetch_brand_ranking(
                 }
             """)
         except Exception as e:
-            # フォールバック: マウスホイール方式
+            logger.warning("JS scroll failed: %s, falling back to mouse wheel", e)
             for i in range(25):
                 page.mouse.wheel(0, 1500)
                 time.sleep(2.0)
+
         time.sleep(2)
+
+        try:
+            html = page.content()
         except Exception as e:
             logger.warning("page.content() failed: %s", e)
+
         browser.close()
 
     logger.info("brand=%s: HTML size=%d bytes", brand_slug, len(html))
