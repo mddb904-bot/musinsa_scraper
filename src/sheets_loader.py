@@ -1,4 +1,8 @@
-"""Googleスプレッドシートへのデータ追記(カラム整合性チェック付き)。"""
+"""Googleスプレッドシートへの追記(スマート追記版)。
+
+最後にデータが入っている行を探して、その次から書き込む。
+手動でデータを消した場合も、消された後に正しく続きを書く。
+"""
 from __future__ import annotations
 
 import logging
@@ -23,28 +27,63 @@ def _row_to_list(row: dict) -> list:
     return [row.get(c) if row.get(c) is not None else "" for c in _COLUMNS]
 
 
+def _find_last_data_row(ws: gspread.Worksheet) -> int:
+    """データが入っている最後の行番号(1-indexed)を返す。空なら0。"""
+    all_values = ws.get_all_values()
+    last = 0
+    for i, row in enumerate(all_values):
+        if any(c.strip() for c in row):
+            last = i + 1
+    return last
+
+
+def _smart_append(
+    ws: gspread.Worksheet,
+    header: list[str],
+    rows_values: list[list],
+) -> int:
+    """ヘッダーを保証しつつ、最後のデータ行の次から書き込む。"""
+    last_row = _find_last_data_row(ws)
+
+    if last_row == 0:
+        # シートが空: ヘッダーを書いてから データ書き込み
+        logger.info("Sheet '%s' is empty, writing header at A1", ws.title)
+        ws.update("A1", [header], value_input_option="RAW")
+        start_row = 2
+    else:
+        # ヘッダー(1行目)を確認
+        first_row = ws.row_values(1)
+        if first_row != header:
+            logger.warning(
+                "Sheet '%s' header mismatch, overwriting row 1",
+                ws.title,
+            )
+            ws.update("A1", [header], value_input_option="RAW")
+        start_row = max(last_row + 1, 2)
+
+    if not rows_values:
+        return 0
+
+    num_rows = len(rows_values)
+    num_cols = len(header)
+    end_row = start_row + num_rows - 1
+    end_col_a1 = gspread.utils.rowcol_to_a1(1, num_cols).rstrip("0123456789")
+    range_str = f"A{start_row}:{end_col_a1}{end_row}"
+
+    ws.update(range_str, rows_values, value_input_option="RAW")
+    logger.info(
+        "Wrote %d rows to sheet '%s' (range: %s)",
+        num_rows, ws.title, range_str,
+    )
+    return num_rows
+
+
 def _ensure_worksheet(sh: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
-    """ワークシートを取得し、ヘッダー行が正しいことを保証する。"""
     try:
-        ws = sh.worksheet(title)
-        logger.info("Found existing worksheet: '%s'", title)
+        return sh.worksheet(title)
     except gspread.WorksheetNotFound:
         logger.info("Creating new worksheet: '%s'", title)
-        ws = sh.add_worksheet(title=title, rows=1000, cols=len(_COLUMNS))
-        ws.update("A1", [_COLUMNS], value_input_option="RAW")
-        return ws
-
-    # 既存タブのヘッダー行を確認
-    first_row = ws.row_values(1)
-    if first_row != _COLUMNS:
-        logger.warning(
-            "Worksheet '%s' header mismatch. Existing=%s, Expected=%s. Overwriting header.",
-            title, first_row[:3] + ['...'] if first_row else [],
-            _COLUMNS[:3] + ['...'],
-        )
-        # ヘッダー行(1行目)を強制的にカラム名で上書き
-        ws.update("A1", [_COLUMNS], value_input_option="RAW")
-    return ws
+        return sh.add_worksheet(title=title, rows=2000, cols=len(_COLUMNS))
 
 
 def _get_gspread_client() -> gspread.Client:
@@ -84,5 +123,4 @@ def load_rows_to_sheets(
     for rtype, group in by_type.items():
         ws = _ensure_worksheet(sh, rtype)
         values = [_row_to_list(r) for r in group]
-        ws.append_rows(values, value_input_option="RAW")
-        logger.info("Appended %d rows to sheet '%s'", len(values), rtype)
+        _smart_append(ws, _COLUMNS, values)
