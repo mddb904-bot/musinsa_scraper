@@ -1,7 +1,4 @@
-"""Googleスプレッドシートへのデータ追記。
-
-ranking_type ごとに別シート(overall / brand_weekly / brand_monthly)に追記する。
-"""
+"""Googleスプレッドシートへのデータ追記(カラム整合性チェック付き)。"""
 from __future__ import annotations
 
 import logging
@@ -27,15 +24,26 @@ def _row_to_list(row: dict) -> list:
 
 
 def _ensure_worksheet(sh: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
+    """ワークシートを取得し、ヘッダー行が正しいことを保証する。"""
     try:
         ws = sh.worksheet(title)
+        logger.info("Found existing worksheet: '%s'", title)
     except gspread.WorksheetNotFound:
+        logger.info("Creating new worksheet: '%s'", title)
         ws = sh.add_worksheet(title=title, rows=1000, cols=len(_COLUMNS))
-        ws.append_row(_COLUMNS, value_input_option="RAW")
+        ws.update("A1", [_COLUMNS], value_input_option="RAW")
         return ws
+
+    # 既存タブのヘッダー行を確認
     first_row = ws.row_values(1)
-    if not first_row:
-        ws.append_row(_COLUMNS, value_input_option="RAW")
+    if first_row != _COLUMNS:
+        logger.warning(
+            "Worksheet '%s' header mismatch. Existing=%s, Expected=%s. Overwriting header.",
+            title, first_row[:3] + ['...'] if first_row else [],
+            _COLUMNS[:3] + ['...'],
+        )
+        # ヘッダー行(1行目)を強制的にカラム名で上書き
+        ws.update("A1", [_COLUMNS], value_input_option="RAW")
     return ws
 
 
@@ -59,12 +67,11 @@ def load_rows_to_sheets(
 
     spreadsheet_id = spreadsheet_id or os.environ.get("GSHEETS_SPREADSHEET_ID")
     if not spreadsheet_id:
-        raise RuntimeError("Spreadsheet ID not specified (set GSHEETS_SPREADSHEET_ID env var)")
+        raise RuntimeError("Spreadsheet ID not specified")
 
     gc = _get_gspread_client()
     sh = gc.open_by_key(spreadsheet_id)
 
-    # 書き込み先スプシのタイトルとURLをログに出す (デバッグ用)
     logger.info(
         "Writing to spreadsheet: title='%s' url='%s'",
         sh.title, sh.url,
