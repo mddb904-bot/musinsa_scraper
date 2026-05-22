@@ -1,4 +1,4 @@
-"""ブランド独自ランキング スクレイパー v5 - HTML DOM抽出 + 診断ダンプ。"""
+"""ブランド独自ランキング スクレイパー v6 - 価格抽出修正版。"""
 from __future__ import annotations
 
 import logging
@@ -16,33 +16,8 @@ _USER_AGENT = (
 )
 
 
-def _dump_html_samples(html: str, brand_slug: str) -> None:
-    """goodsNo出現箇所の周辺を診断ダンプ。"""
-    positions = []
-    search_start = 0
-    while len(positions) < 3:
-        idx = html.find("goodsNo", search_start)
-        if idx < 0:
-            break
-        positions.append(idx)
-        search_start = idx + 1
-
-    for i, pos in enumerate(positions, 1):
-        start = max(0, pos - 200)
-        end = min(len(html), pos + 600)
-        sample = html[start:end].replace("\n", " ").replace("  ", " ")
-        logger.warning(
-            "[DIAG] brand=%s goodsNo #%d at offset=%d, total=%d:",
-            brand_slug, i, pos, len(html),
-        )
-        # 250文字ずつ分割してログ
-        for j in range(0, len(sample), 250):
-            logger.warning("  %s", sample[j:j+250])
-
-
 def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
-    """HTMLから商品データを抽出する(URLパターン中心)。"""
-    # /jp/goods/<数字> の出現順 = ランキング順
+    """HTMLから商品データを抽出する。"""
     pattern = re.compile(r'/jp/goods/(\d+)')
     seen: set[str] = set()
     ordered_with_pos: list[tuple[str, int]] = []
@@ -61,12 +36,17 @@ def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
     if not ordered_with_pos:
         return []
 
-    # 各商品の周辺HTMLから画像URLと価格を抽出
+    # 各商品の周辺HTMLから属性を抽出
     items = []
-    for gid, pos in ordered_with_pos:
-        # 各商品の周辺2500文字を切り出して属性を探す
-        section = html[pos:pos + 3000]
+    for i, (gid, pos) in enumerate(ordered_with_pos):
+        # 次の商品の開始位置までを切り出す (なければ末尾までだが範囲を制限)
+        if i + 1 < len(ordered_with_pos):
+            next_pos = ordered_with_pos[i + 1][1]
+            section = html[pos:next_pos]
+        else:
+            section = html[pos:pos + 3000]
 
+        # 画像URL
         img_url = None
         img_m = re.search(
             r'<img[^>]+src=["\']([^"\']*image\.msscdn\.net[^"\']+)["\']',
@@ -75,21 +55,44 @@ def _extract_from_html(html: str, brand_slug: str) -> list[dict]:
         if img_m:
             img_url = img_m.group(1)
 
+        # 価格抽出: ¥価格 を全部拾って、後ろにあるものを採用
+        # 定価 → 割引率 → セール後 の順で出るため、最後の数値=セール後価格
+        price_matches = re.findall(r'¥\s*([\d,]+)', section)
         price = None
-        price_m = re.search(r'¥\s*([\d,]+)', section)
-        if price_m:
+        normal_price = None
+        sale_rate = None
+        if price_matches:
             try:
-                price = int(price_m.group(1).replace(",", ""))
+                # 最後の価格 = セール後価格 (セールしてない場合は定価と同じ)
+                price = int(price_matches[-1].replace(",", ""))
+                # 複数価格があれば最初が定価
+                if len(price_matches) >= 2:
+                    normal_price = int(price_matches[0].replace(",", ""))
+                else:
+                    normal_price = price
             except ValueError:
-                price = None
+                pass
+
+        # セール率 (例: "10%" "20%" などの数字%パターン)
+        # 価格の近くに 数字% があれば割引率と判定
+        rate_m = re.search(r'(\d{1,2})\s*%\s*OFF|(\d{1,2})\s*%', section)
+        if rate_m:
+            try:
+                rate_str = rate_m.group(1) or rate_m.group(2)
+                rate_val = int(rate_str)
+                if 0 < rate_val < 100:
+                    sale_rate = rate_val
+            except (ValueError, TypeError):
+                pass
 
         items.append({
             "goodsNo": gid,
             "brandId": brand_slug,
             "brandName": brand_slug.upper(),
             "imageUrl": img_url,
-            "price": price,
-            # 他のフィールドはNULL
+            "price": price,                # セール後 (なければ定価と同じ)
+            "normalPrice": normal_price,   # 定価
+            "saleRate": sale_rate,         # セール率(%)
         })
 
     return items
@@ -124,7 +127,6 @@ def fetch_brand_ranking(
             logger.warning("page.goto: %s", e)
 
         time.sleep(5)
-
         for i in range(15):
             page.mouse.wheel(0, 5000)
             time.sleep(0.5)
@@ -138,12 +140,6 @@ def fetch_brand_ranking(
 
     logger.info("brand=%s: HTML size=%d bytes", brand_slug, len(html))
 
-    # 最初のブランド(mucent)の最初のperiod(weekly)時にHTMLサンプルをダンプ
-    # → 構造解析用の診断情報
-    if brand_slug.lower() == "mucent" and period == "weekly":
-        _dump_html_samples(html, brand_slug)
-
-    # HTML抽出
     items = _extract_from_html(html, brand_slug)
 
     logger.info(
