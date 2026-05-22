@@ -154,9 +154,15 @@ def fetch_brand_ranking(
         except Exception as e:
             logger.warning("page.goto: %s", e)
         time.sleep(5)
-        for i in range(15):
-            page.mouse.wheel(0, 5000)
-            time.sleep(0.5)
+        for i in range(20):
+            page.mouse.wheel(0, 2000)  # 小さいスクロール幅で確実に
+            time.sleep(1.5)            # React描画待ち
+        # スクロール後、追加で描画を待つ
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+        time.sleep(2)
         try:
             html = page.content()
         except Exception as e:
