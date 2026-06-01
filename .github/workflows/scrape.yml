@@ -36,10 +36,10 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
+    
     env:
-      # BigQuery
-      BQ_TABLE: ${{ secrets.BQ_TABLE }}           # 例: my-project.musinsa.ranking
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true      # ← この1行を追加
+      BQ_TABLE: ${{ secrets.BQ_TABLE }}
       GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
 
       # スプレッドシート
