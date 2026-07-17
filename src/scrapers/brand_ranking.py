@@ -110,19 +110,27 @@ def fetch_brand_ranking_list(
         except Exception as e:
             logger.warning("page.goto: %s", e)
 
-        # APIレスポンスが傍受されるまで待つ
+        # APIレスポンスが傍受されるまで待つ。
+        # 注意: Playwright sync API では time.sleep() 中は response イベントが
+        # ディスパッチされない(Python側のイベントループが回らない)ため、
+        # ブラウザが応答を受信済みでも on_response が発火しない。
+        # page.wait_for_timeout() はイベントループを回すので、待機はこちらを使う。
         for _ in range(20):
             if captured:
                 break
-            time.sleep(0.5)
+            page.wait_for_timeout(500)
 
-        # まだなら軽くスクロールして再発火を促す
+        # まだなら軽くスクロールして再発火を促し、さらに待つ
         if not captured:
             try:
                 page.mouse.wheel(0, 3000)
-                time.sleep(2)
+                page.wait_for_timeout(2000)
             except Exception:
                 pass
+            for _ in range(10):
+                if captured:
+                    break
+                page.wait_for_timeout(500)
 
         brand_list = captured[0] if captured else []
         if not brand_list:
