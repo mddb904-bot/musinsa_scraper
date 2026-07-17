@@ -31,6 +31,18 @@ on:
         default: 'false'
         type: choice
         options: ['false', 'true']
+      dry_run:
+        description: 'お試し実行（取得のみ・BQ/Sheets/Slackに書き込まない）'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      dump_sample:
+        description: '生データの先頭1件をログ出力（カテゴリ有無の確認用）'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
 
 jobs:
   scrape:
@@ -72,6 +84,8 @@ jobs:
           ARGS=""
           if [ "${{ github.event.inputs.skip_overall }}" = "true" ]; then ARGS="$ARGS --skip-overall"; fi
           if [ "${{ github.event.inputs.skip_brand }}" = "true" ]; then ARGS="$ARGS --skip-brand"; fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "${{ github.event.inputs.dump_sample }}" = "true" ]; then ARGS="$ARGS --dump-sample"; fi
           python -m src.main $ARGS
 
       - name: Cleanup credentials
