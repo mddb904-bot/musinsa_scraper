@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -75,6 +76,12 @@ def run(args: argparse.Namespace) -> int:
                 gender=ov_cfg.get("gender", "F"),
                 request_interval_seconds=interval,
             )
+            if args.dump_sample and items:
+                logger.info("=== RAW overall[0] keys: %s", list(items[0].keys()))
+                logger.info(
+                    "=== RAW overall[0] json: %s",
+                    json.dumps(items[0], ensure_ascii=False)[:3000],
+                )
             rows = [
                 normalize_goods(
                     g,
@@ -176,6 +183,11 @@ def main() -> None:
     p.add_argument("--no-sheets", action="store_true", help="スプレッドシートへの書き込みをスキップ")
     p.add_argument("--notify-on-success", action="store_true", help="成功時もSlack通知")
     p.add_argument("--fail-fast", action="store_true", help="最初のエラーで即終了")
+    p.add_argument(
+        "--dump-sample",
+        action="store_true",
+        help="取得した生データの先頭1件をログ出力（カテゴリ有無などの確認用）",
+    )
     args = p.parse_args()
     sys.exit(run(args))
 
