@@ -58,9 +58,9 @@ def _row_to_list(row: dict) -> list:
     return [row.get(c) if row.get(c) is not None else "" for c in _COLUMNS]
 
 
-def _end_col_letter() -> str:
+def _end_col_letter(n_cols: int) -> str:
     return gspread.utils.rowcol_to_a1(
-        1, _DATA_COL_START + len(_COLUMNS) - 1
+        1, _DATA_COL_START + n_cols - 1
     ).rstrip("0123456789")
 
 
@@ -77,23 +77,25 @@ def _find_last_data_row(ws: gspread.Worksheet) -> int:
 def _smart_append(
     ws: gspread.Worksheet,
     rows_values: list[list],
+    columns_jp: list[str] | None = None,
 ) -> int:
     """日本語ヘッダーを保証し、B列から最終データ行の次に追記する。"""
+    columns_jp = columns_jp if columns_jp is not None else _COLUMNS_JP
     last_row = _find_last_data_row(ws)
-    end_col = _end_col_letter()
+    end_col = _end_col_letter(len(columns_jp))
 
     if last_row == 0:
         # 空シート: B1に日本語ヘッダーを書く
         logger.info("Sheet '%s' is empty, writing header at B1", ws.title)
-        ws.update(f"B1:{end_col}1", [_COLUMNS_JP], value_input_option="RAW")
+        ws.update(f"B1:{end_col}1", [columns_jp], value_input_option="RAW")
         start_row = 2
     else:
         # B1のヘッダーを確認し、日本語でなければ上書き
         row_1 = ws.row_values(1)
-        current_header = row_1[1:1 + len(_COLUMNS_JP)] if len(row_1) > 1 else []
-        if current_header != _COLUMNS_JP:
+        current_header = row_1[1:1 + len(columns_jp)] if len(row_1) > 1 else []
+        if current_header != columns_jp:
             logger.info("Sheet '%s': updating header to Japanese", ws.title)
-            ws.update(f"B1:{end_col}1", [_COLUMNS_JP], value_input_option="RAW")
+            ws.update(f"B1:{end_col}1", [columns_jp], value_input_option="RAW")
         start_row = max(last_row + 1, 2)
 
     if not rows_values:
@@ -171,3 +173,60 @@ def load_rows_to_sheets(
         ws = _ensure_worksheet(sh, tab_name, old_title=rtype)
         values = [_row_to_list(r) for r in group]
         _smart_append(ws, values)
+
+
+# ============================================================
+# ブランドランキング(ブランド単位・日次) 用
+# ============================================================
+
+_BRAND_COLUMNS = [
+    "date_key", "rank", "brand_id", "brand_name",
+    "brand_url", "is_musinsa_exclusive", "scraped_at",
+]
+
+_BRAND_COLUMNS_JP = [
+    "取得日",          # date_key
+    "順位",            # rank
+    "ブランドID",       # brand_id
+    "ブランド名",       # brand_name
+    "ブランドURL",      # brand_url
+    "MUSINSA独占",     # is_musinsa_exclusive
+    "取得日時",         # scraped_at
+]
+
+_BRAND_TAB_NAME = "ブランドランキング"
+
+
+def _brand_row_to_list(row: dict) -> list:
+    out: list = []
+    for c in _BRAND_COLUMNS:
+        v = row.get(c)
+        if c == "is_musinsa_exclusive":
+            # True→TRUE / False→FALSE / None(判定不能)→空
+            out.append("" if v is None else ("TRUE" if v else "FALSE"))
+        else:
+            out.append("" if v is None else v)
+    return out
+
+
+def load_brand_rows_to_sheets(
+    rows: Iterable[dict],
+    spreadsheet_id: str | None = None,
+) -> None:
+    """ブランドランキングを専用タブ(ブランドランキング)に追記する。"""
+    rows_list = list(rows)
+    if not rows_list:
+        logger.info("No brand rows to load to Sheets, skipping")
+        return
+
+    spreadsheet_id = spreadsheet_id or os.environ.get("GSHEETS_SPREADSHEET_ID")
+    if not spreadsheet_id:
+        raise RuntimeError("Spreadsheet ID not specified")
+
+    gc = _get_gspread_client()
+    sh = gc.open_by_key(spreadsheet_id)
+    logger.info("Writing brand ranking to spreadsheet: title='%s'", sh.title)
+
+    ws = _ensure_worksheet(sh, _BRAND_TAB_NAME)
+    values = [_brand_row_to_list(r) for r in rows_list]
+    _smart_append(ws, values, columns_jp=_BRAND_COLUMNS_JP)
