@@ -99,10 +99,20 @@ def normalize_goods(
     landing = raw.get("landingUrl") or ""
     product_url = f"https://global.musinsa.com{landing}" if landing.startswith("/") else landing
 
+    product_brand_name = raw.get("brandName")
+    product_brand_id = raw.get("brandId")
+
+    # (B) 全体ランキング(overall)では「ブランド名」列に商品のブランドを入れる。
+    #     取れなければ従来どおり呼び出し側の値(= "All")にフォールバック。
+    #     ブランド別ランキングは従来どおり呼び出し側の値(= ブランド名)のまま。
+    effective_brand_name = brand_name
+    if ranking_type == "overall" and product_brand_name:
+        effective_brand_name = product_brand_name
+
     return {
         "date_key": date_key,
         "ranking_type": ranking_type,
-        "brand_name": brand_name,
+        "brand_name": effective_brand_name,
         "brand_id": brand_id,
         "rank": rank,
         "product_id": str(raw.get("goodsNo") or ""),
@@ -115,8 +125,8 @@ def normalize_goods(
         "favorite_count": _to_int(raw.get("likeCount")),
         "listing_date": _extract_listing_date(image_url or ""),
         "product_url": product_url or None,
-        "product_brand_name": raw.get("brandName"),
-        "product_brand_id": raw.get("brandId"),
+        "product_brand_name": product_brand_name,
+        "product_brand_id": product_brand_id,
         "scraped_at": scraped_at_iso,
     }
 
@@ -128,3 +138,31 @@ def _to_int(v: Any) -> int | None:
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+def normalize_brand(
+    raw: dict,
+    *,
+    date_key: str,
+    scraped_at_iso: str,
+) -> dict:
+    """ブランドランキングの1件をBigQuery/Sheets用スキーマに変換する。
+
+    raw は brand_ranking スクレイパーが返す
+    {rank, brand_id, brand_name, brand_url, is_musinsa_exclusive} を想定。
+    """
+    landing = raw.get("brand_url") or raw.get("landingUrl") or ""
+    if isinstance(landing, str) and landing.startswith("/"):
+        brand_url = f"https://global.musinsa.com{landing}"
+    else:
+        brand_url = landing or None
+
+    return {
+        "date_key": date_key,
+        "rank": _to_int(raw.get("rank")),
+        "brand_id": raw.get("brand_id") or raw.get("id"),
+        "brand_name": raw.get("brand_name") or raw.get("name"),
+        "brand_url": brand_url,
+        "is_musinsa_exclusive": raw.get("is_musinsa_exclusive"),
+        "scraped_at": scraped_at_iso,
+    }

@@ -38,3 +38,11 @@ brand_top_n: 200  # 各ブランドで上位何件まで取得するか
 
 # リクエスト間隔(サーバー負荷配慮 / 秒)
 request_interval_seconds: 2
+
+# ブランドランキング(ブランド単位・日次) — src.run_brand_ranking で使用
+# 期間タブは無いため常に単一の順位表。毎日1回取得して当日分として蓄積する。
+brand_ranking:
+  url: "https://global.musinsa.com/jp/trending/brands?toggleCountry=jp"
+  top_n: 100            # 上位N件
+  detect_exclusive: true  # 各ブランドページを開いて「MUSINSA 独占」判定(案A)
+  request_interval_seconds: 1.0  # ブランドページ巡回時の間隔
