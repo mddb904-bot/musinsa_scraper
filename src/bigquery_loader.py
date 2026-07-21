@@ -73,6 +73,13 @@ def load_brand_rows_to_bigquery(rows: list[dict], table: str | None = None) -> N
     table = _derive_brand_table(table)
     client = bigquery.Client()
 
+    # is_musinsa_exclusive は「独占(True) or NULL」で保持する。
+    # 非独占(False)・判定不能(None) はいずれも NULL にする(列型は BOOL のまま)。
+    load_rows = [
+        {**r, "is_musinsa_exclusive": (True if r.get("is_musinsa_exclusive") else None)}
+        for r in rows
+    ]
+
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
@@ -80,7 +87,7 @@ def load_brand_rows_to_bigquery(rows: list[dict], table: str | None = None) -> N
     )
 
     logger.info("Loading %d brand rows into %s via batch load job", len(rows), table)
-    job = client.load_table_from_json(rows, table, job_config=job_config)
+    job = client.load_table_from_json(load_rows, table, job_config=job_config)
     job.result()
 
     if job.errors:

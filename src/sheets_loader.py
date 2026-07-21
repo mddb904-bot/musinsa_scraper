@@ -202,8 +202,8 @@ def _brand_row_to_list(row: dict) -> list:
     for c in _BRAND_COLUMNS:
         v = row.get(c)
         if c == "is_musinsa_exclusive":
-            # True→TRUE / False→FALSE / None(判定不能)→空
-            out.append("" if v is None else ("TRUE" if v else "FALSE"))
+            # True→「独占」 / False(非独占)・None(判定不能)→空欄
+            out.append("独占" if v else "")
         else:
             out.append("" if v is None else v)
     return out
