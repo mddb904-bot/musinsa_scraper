@@ -170,6 +170,80 @@ def _resolve_category_name(page, code: str, timeout_ms: int, log_detail: bool) -
     return name
 
 
+def _harvest_code_name(obj) -> list[tuple[str, str]]:
+    """JSON を再帰的に走査し、同じ辞書内に数値コードと名前を持つ要素を (code, name) で集める。"""
+    out: list[tuple[str, str]] = []
+    if isinstance(obj, dict):
+        code = None
+        name = None
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if isinstance(v, str):
+                s = v.strip()
+                if "code" in kl and s.isdigit():
+                    code = s
+                elif kl in ("name", "categoryname", "title", "displayname", "label") and s:
+                    name = s
+        if code and name and len(name) <= 20 and name.upper() not in ("GLOBAL MUSINSA", "MUSINSA"):
+            out.append((code, name))
+        for v in obj.values():
+            out.extend(_harvest_code_name(v))
+    elif isinstance(obj, list):
+        for v in obj:
+            out.extend(_harvest_code_name(v))
+    return out
+
+
+def _fetch_category_map(page, timeout_ms: int, log_detail: bool = False) -> dict[str, str]:
+    """カテゴリ対応表（コード→名前）を、トップスのランキングページから傍受して構築する。
+
+    ページが読み込むカテゴリツリー系JSONに、長袖(001010)等の中カテゴリ名とコードが
+    含まれる。名前とコードを同じ辞書から拾って {code: name} を作る。
+    """
+    captured: list[tuple[str, str]] = []
+
+    def on_resp(r) -> None:
+        try:
+            if "application/json" not in r.headers.get("content-type", ""):
+                return
+            t = r.text()
+        except Exception:
+            return
+        tl = t.lower()
+        if "長袖" in t or "category2depth" in tl or "categorydepth" in tl or "childcategor" in tl:
+            captured.append((r.url, t))
+
+    page.on("response", on_resp)
+    try:
+        page.goto(
+            "https://global.musinsa.com/jp/trending/items?gender=F&category1DepthCode=001&toggleCountry=jp",
+            wait_until="domcontentloaded", timeout=timeout_ms,
+        )
+        page.wait_for_timeout(3500)
+    except Exception as e:
+        logger.warning("category map fetch failed: %s", e)
+    try:
+        page.remove_listener("response", on_resp)
+    except Exception:
+        pass
+
+    cmap: dict[str, str] = {}
+    for _url, t in captured:
+        try:
+            data = json.loads(t)
+        except Exception:
+            continue
+        for code, name in _harvest_code_name(data):
+            cmap.setdefault(code, name)
+
+    if log_detail:
+        for url, t in captured[:4]:
+            logger.info("  [TREE %s] %s", url.split("?")[0][-60:], t[:1500])
+        logger.info("  category map: %d entries, sample=%s",
+                    len(cmap), dict(list(cmap.items())[:20]))
+    return cmap
+
+
 def enrich_items_with_category(
     items: list[dict],
     *,
@@ -231,15 +305,22 @@ def enrich_items_with_category(
                 logger.info("  code progress: %d/%d", idx + 1, len(goods_ids))
             page.wait_for_timeout(int(request_interval_seconds * 1000))
 
-        # --- フェーズ2: ユニークなカテゴリコードを名前に変換（使い回し）---
+        # --- フェーズ2: カテゴリ対応表（コード→名前）で中カテゴリ名に変換 ---
+        cmap = _fetch_category_map(page, timeout_ms, log_detail=log_samples > 0)
         unique_codes = sorted(set(goods_code.values()))
-        logger.info("Resolving %d unique category codes to names...", len(unique_codes))
+        logger.info("Resolving %d unique category codes (map has %d entries)...",
+                    len(unique_codes), len(cmap))
         code_name: dict[str, str] = {}
         for j, code in enumerate(unique_codes):
-            name = _resolve_category_name(page, code, timeout_ms, log_detail=j < log_samples)
+            name = cmap.get(code)
+            if not name:
+                # 対応表に無ければカテゴリページのタイトルで代替（広めの名前）
+                name = _resolve_category_name(page, code, timeout_ms, log_detail=j < log_samples)
+                page.wait_for_timeout(int(request_interval_seconds * 1000))
+            if j < log_samples:
+                logger.info("  code %s -> %s", code, name)
             if name:
                 code_name[code] = name
-            page.wait_for_timeout(int(request_interval_seconds * 1000))
 
         browser.close()
 
