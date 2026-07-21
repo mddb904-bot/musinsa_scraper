@@ -61,6 +61,49 @@ def _extract_breadcrumb_from_ldjson(ld_texts: list[str]) -> list[str]:
     return []
 
 
+def _iter_ldjson_objects(ld_texts: list[str]):
+    """ld+json 群を @graph 展開して個々のオブジェクトを列挙する。"""
+    for text in ld_texts:
+        try:
+            data = json.loads(text)
+        except Exception:
+            continue
+        objs = data if isinstance(data, list) else [data]
+        for o in objs:
+            if isinstance(o, dict) and isinstance(o.get("@graph"), list):
+                for g in o["@graph"]:
+                    yield g
+            else:
+                yield o
+
+
+def _mid_from_path(cat: str) -> str:
+    """'A > B > C' や 'A/B/C' のようなカテゴリ表記から末端（中カテゴリ）を取り出す。"""
+    for sep in (">", "＞", "/", "|"):
+        if sep in cat:
+            parts = [p.strip() for p in cat.split(sep) if p.strip()]
+            if parts:
+                return parts[-1]
+    return cat.strip()
+
+
+def _extract_product_category(ld_texts: list[str]) -> str | None:
+    """schema.org Product の category 項目からカテゴリ名を取り出す。"""
+    for o in _iter_ldjson_objects(ld_texts):
+        if not isinstance(o, dict):
+            continue
+        t = o.get("@type")
+        is_product = t == "Product" or (isinstance(t, list) and "Product" in t)
+        if not is_product:
+            continue
+        cat = o.get("category")
+        if isinstance(cat, dict):
+            cat = cat.get("name")
+        if isinstance(cat, str) and cat.strip():
+            return _mid_from_path(cat)
+    return None
+
+
 def _pick_mid_from_breadcrumb(names: list[str]) -> str | None:
     """パンくず（ルート→末端）から中カテゴリ名を選ぶ。
 
@@ -138,16 +181,16 @@ def enrich_items_with_category(
                 ld_texts = []
 
             breadcrumb = _extract_breadcrumb_from_ldjson(ld_texts)
-            name = _pick_mid_from_breadcrumb(breadcrumb)
+            name = _pick_mid_from_breadcrumb(breadcrumb) or _extract_product_category(ld_texts)
             code = seen_code["code"]
 
             if idx < log_samples:
-                logger.info("goods %s: ld+json=%d, breadcrumb=%s, itemCategoryCode=%s",
-                            g, len(ld_texts), breadcrumb, code or "(none)")
-                if not breadcrumb:
-                    # 診断: ld+json のスニペット
+                logger.info("goods %s: ld+json=%d, breadcrumb=%s, product_category=%s, itemCategoryCode=%s",
+                            g, len(ld_texts), breadcrumb, _extract_product_category(ld_texts), code or "(none)")
+                if not name:
+                    # 診断: ld+json のフルスニペット
                     for i, t in enumerate(ld_texts[:3]):
-                        logger.info("    ld+json[%d]: %s", i, t[:600])
+                        logger.info("    ld+json[%d]: %s", i, t[:2500])
 
             if name:
                 unique[g] = name
