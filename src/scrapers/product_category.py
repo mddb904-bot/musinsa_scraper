@@ -145,7 +145,13 @@ def enrich_items_with_category(
             url = f"https://global.musinsa.com/jp/goods/{g}?toggleCountry=jp"
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(2000)
+                # 遅延ロードの商品詳細API等を発火させる
+                try:
+                    page.mouse.wheel(0, 2500)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2500)
             except Exception as e:
                 logger.warning("category fetch failed for goods %s: %s", g, e)
                 page.wait_for_timeout(int(request_interval_seconds * 1000))
@@ -184,14 +190,18 @@ def enrich_items_with_category(
             if idx < log_samples:
                 logger.info("goods %s: %d json responses, %d embedded json blobs",
                             g, len(responses), len(embedded))
+                # 全レスポンスURLを列挙（商品詳細APIを特定するため）
+                for u, _b, _t in responses:
+                    logger.info("    URL: %s", u[:130])
+                # 商品詳細っぽいレスポンス(goods/product/detail)の中身をダンプ
+                for u, _b, text in responses:
+                    ul = u.lower()
+                    if any(x in ul for x in ("goods", "product", "detail")) and str(g) in u:
+                        logger.info("  [GOODS %s] snippet: %s", u.split("?")[0][-70:], text[:2500])
                 # カテゴリという語を含むデータ源の生スニペット
-                for src_name, body, text in [(u, b, t) for (u, b, t) in responses]:
+                for u, _b, text in responses:
                     if "categor" in text.lower():
-                        logger.info("  [resp %s] snippet: %s",
-                                    src_name.split("?")[0][-60:], text[:1200])
-                for i, blob in enumerate(embedded):
-                    if "categor" in blob.lower():
-                        logger.info("  [embedded %d] snippet: %s", i, blob[:1200])
+                        logger.info("  [resp %s] snippet: %s", u.split("?")[0][-60:], text[:800])
                 logger.info("  category candidates: %s",
                             sorted({(k, v) for (_p, k, v) in candidates})[:20])
 
