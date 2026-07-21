@@ -1,21 +1,22 @@
-"""商品の中カテゴリを、商品詳細ページを開いて取得する（方法A）。
+"""商品の中カテゴリを、商品詳細ページを開いて取得する（方法A/B）。
 
-ランキングAPIのレスポンスには中カテゴリが含まれないため、商品詳細ページ
-(/jp/goods/{goodsNo}) を開いて中カテゴリ（category2Depth 相当）を取得する。
+ランキングAPIにも商品ページの各JSON APIにも「中カテゴリ名」は含まれず、
+商品情報はサーバー側でHTMLに埋め込まれる。そこで:
 
-カテゴリ情報がページのどこ（傍受JSON / 埋め込み __NEXT_DATA__ 等）に入るか
-確定させるため、最初の数商品では「カテゴリを含むデータ源の生スニペット」を
-ログ出力する診断モードを備える。抽出は、キー/パスに 'categor' を含み値が
-カテゴリ名らしいスカラーを候補化し、中カテゴリらしさでスコア選択する。
+  B（名前）: ページの構造化データ ld+json（schema.org BreadcrumbList）から
+             パンくずを取り出し、中カテゴリ名を得る。
+  A（コード）: 通信URLに含まれる itemCategoryCode（例 001001）を確保する保険。
 
-重い処理（商品ごとに1ページ開く）なので、呼び出し側のフラグで on/off する。
+`_category` には名前（取れれば）を、取れなければコードを入れる。
+重い処理（商品ごとに1ページ開く）なので呼び出し側フラグで on/off する。
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
 
-from playwright.sync_api import sync_playwright, Response
+from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -24,66 +25,54 @@ _USER_AGENT = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-
-def _walk_scalars(obj, path: str = ""):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(v, (dict, list)):
-                yield from _walk_scalars(v, f"{path}.{k}")
-            else:
-                yield (path, str(k), v)
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            if isinstance(v, (dict, list)):
-                yield from _walk_scalars(v, f"{path}[{i}]")
+_ITEM_CAT_RE = re.compile(r"itemCategoryCode=(\d+)")
 
 
-def _looks_like_category_name(value) -> bool:
-    if not isinstance(value, str):
-        return False
-    s = value.strip()
-    if not s or len(s) > 30:
-        return False
-    if s.lower() in ("true", "false", "null", "none"):
-        return False
-    if s.startswith(("http", "#", "/")) or "/" in s or "." in s:
-        return False
-    return True
-
-
-def _category_candidates(data) -> list[tuple[str, str, str]]:
-    hits: list[tuple[str, str, str]] = []
-    for path, key, value in _walk_scalars(data):
-        if not _looks_like_category_name(value):
+def _extract_breadcrumb_from_ldjson(ld_texts: list[str]) -> list[str]:
+    """ld+json の BreadcrumbList から名前リスト（ルート→末端）を取り出す。"""
+    for text in ld_texts:
+        try:
+            data = json.loads(text)
+        except Exception:
             continue
-        if "categor" in key.lower() or "categor" in path.lower():
-            hits.append((path, key, value.strip()))
-    return hits
+        objs = data if isinstance(data, list) else [data]
+        # @graph を持つ形式にも対応
+        expanded = []
+        for o in objs:
+            if isinstance(o, dict) and isinstance(o.get("@graph"), list):
+                expanded.extend(o["@graph"])
+            else:
+                expanded.append(o)
+        for o in expanded:
+            if not isinstance(o, dict):
+                continue
+            if o.get("@type") == "BreadcrumbList" and isinstance(o.get("itemListElement"), list):
+                names = []
+                for el in o["itemListElement"]:
+                    if not isinstance(el, dict):
+                        continue
+                    name = el.get("name")
+                    if not name and isinstance(el.get("item"), dict):
+                        name = el["item"].get("name")
+                    if name:
+                        names.append(str(name).strip())
+                if names:
+                    return names
+    return []
 
 
-def _score(path: str, key: str) -> int:
-    t = f"{path}.{key}".lower()
-    s = 0
-    if any(x in t for x in ("2depth", "depth2", "category2", "middle", "second", "medium")):
-        s += 100
-    if "name" in t:
-        s += 20
-    if any(x in t for x in ("3depth", "depth3", "category3", "small")):
-        s += 5
-    if any(x in t for x in ("1depth", "depth1", "category1", "large", "first")):
-        s -= 50
-    if "brand" in t:
-        s -= 1000
-    if any(x in t for x in ("code", "id", "url", "link", "version", "enabled", "menu", "yn", "count")):
-        s -= 200
-    return s
+def _pick_mid_from_breadcrumb(names: list[str]) -> str | None:
+    """パンくず（ルート→末端）から中カテゴリ名を選ぶ。
 
-
-def _pick_mid_category(candidates: list[tuple[str, str, str]]) -> str | None:
-    if not candidates:
+    先頭の「ホーム」的な要素や性別（レディース/メンズ）を除き、最も末端（具体的）を採用。
+    """
+    if not names:
         return None
-    best = max(candidates, key=lambda c: _score(c[0], c[1]))
-    return best[2] if _score(best[0], best[1]) > 0 else None
+    drop = {"ホーム", "Home", "HOME", "トップ画面", "ホーム画面",
+            "レディース", "メンズ", "WOMEN", "MEN", "キッズ", "KIDS"}
+    filtered = [n for n in names if n and n not in drop]
+    seq = filtered or names
+    return seq[-1]  # 最も具体的なカテゴリ（＝商品の中カテゴリ）
 
 
 def enrich_items_with_category(
@@ -91,16 +80,10 @@ def enrich_items_with_category(
     *,
     request_interval_seconds: float = 1.0,
     timeout_ms: int = 20000,
-    log_samples: int = 2,
+    log_samples: int = 3,
     category_limit: int = 0,
 ) -> None:
-    """items に in-place で `_category`（中カテゴリ）を付与する。
-
-    データ源（傍受JSON / __NEXT_DATA__ / application/json スクリプト）を横断して
-    カテゴリ候補を集める。最初の log_samples 件では、カテゴリを含む生データの
-    スニペットをログ出力して項目位置を特定できるようにする。
-    category_limit > 0 なら先頭N件のユニーク商品だけを対象（動作確認用）。
-    """
+    """items に in-place で `_category`（中カテゴリ名 or コード）を付与する。"""
     if not items:
         return
 
@@ -115,100 +98,65 @@ def enrich_items_with_category(
         goods_ids = goods_ids[:category_limit]
         logger.info("Category enrichment: LIMITED to first %d unique products (test mode)", len(goods_ids))
 
-    logger.info(
-        "Category enrichment: opening %d product pages (of %d items)...",
-        len(goods_ids), len(items),
-    )
+    logger.info("Category enrichment: opening %d product pages (of %d items)...",
+                len(goods_ids), len(items))
 
-    # 傍受した JSON レスポンス (url, parsed_body, raw_text) を貯める
-    responses: list[tuple[str, object, str]] = []
+    seen_code: dict[str, str] = {"code": ""}
 
-    def on_response(response: Response) -> None:
-        try:
-            if "application/json" not in response.headers.get("content-type", ""):
-                return
-            text = response.text()
-            body = json.loads(text)
-        except Exception:
-            return
-        responses.append((response.url, body, text))
+    def on_request(request) -> None:
+        m = _ITEM_CAT_RE.search(request.url)
+        if m:
+            seen_code["code"] = m.group(1)
 
-    got = 0
+    by_name = 0
+    by_code = 0
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=_USER_AGENT, locale="ja-JP")
         page = context.new_page()
-        page.on("response", on_response)
+        page.on("request", on_request)
 
         for idx, g in enumerate(goods_ids):
-            responses.clear()
+            seen_code["code"] = ""
             url = f"https://global.musinsa.com/jp/goods/{g}?toggleCountry=jp"
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 page.wait_for_timeout(2000)
-                # 遅延ロードの商品詳細API等を発火させる
-                try:
-                    page.mouse.wheel(0, 2500)
-                except Exception:
-                    pass
-                page.wait_for_timeout(2500)
             except Exception as e:
                 logger.warning("category fetch failed for goods %s: %s", g, e)
                 page.wait_for_timeout(int(request_interval_seconds * 1000))
                 continue
 
-            # 埋め込み JSON (__NEXT_DATA__ / application/json)
-            embedded: list[str] = []
+            # ld+json（BreadcrumbList）を読む
+            ld_texts = []
             try:
-                embedded = page.evaluate(
-                    """() => {
-                        const out = [];
-                        const nd = document.getElementById('__NEXT_DATA__');
-                        if (nd && nd.textContent) out.push(nd.textContent);
-                        document.querySelectorAll('script[type="application/json"]').forEach(s => {
-                            if (s.textContent) out.push(s.textContent);
-                        });
-                        return out;
-                    }"""
+                ld_texts = page.evaluate(
+                    """() => Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+                        .map(s => s.textContent).filter(Boolean)"""
                 ) or []
             except Exception:
-                embedded = []
+                ld_texts = []
 
-            # 全データ源から候補を集める
-            sources: list[tuple[str, object]] = [(u, b) for (u, b, _t) in responses]
-            for i, blob in enumerate(embedded):
-                try:
-                    sources.append((f"embedded[{i}]", json.loads(blob)))
-                except Exception:
-                    pass
+            breadcrumb = _extract_breadcrumb_from_ldjson(ld_texts)
+            name = _pick_mid_from_breadcrumb(breadcrumb)
+            code = seen_code["code"]
 
-            candidates: list[tuple[str, str, str]] = []
-            for _src, body in sources:
-                candidates.extend(_category_candidates(body))
-
-            # --- 診断ログ: 最初の数件だけ ---
             if idx < log_samples:
-                logger.info("goods %s: %d json responses, %d embedded json blobs",
-                            g, len(responses), len(embedded))
-                # 全レスポンスURLを列挙（商品詳細APIを特定するため）
-                for u, _b, _t in responses:
-                    logger.info("    URL: %s", u[:130])
-                # 商品詳細っぽいレスポンス(goods/product/detail)の中身をダンプ
-                for u, _b, text in responses:
-                    ul = u.lower()
-                    if any(x in ul for x in ("goods", "product", "detail")) and str(g) in u:
-                        logger.info("  [GOODS %s] snippet: %s", u.split("?")[0][-70:], text[:2500])
-                # カテゴリという語を含むデータ源の生スニペット
-                for u, _b, text in responses:
-                    if "categor" in text.lower():
-                        logger.info("  [resp %s] snippet: %s", u.split("?")[0][-60:], text[:800])
-                logger.info("  category candidates: %s",
-                            sorted({(k, v) for (_p, k, v) in candidates})[:20])
+                logger.info("goods %s: ld+json=%d, breadcrumb=%s, itemCategoryCode=%s",
+                            g, len(ld_texts), breadcrumb, code or "(none)")
+                if not breadcrumb:
+                    # 診断: ld+json のスニペット
+                    for i, t in enumerate(ld_texts[:3]):
+                        logger.info("    ld+json[%d]: %s", i, t[:600])
 
-            cat = _pick_mid_category(candidates)
-            unique[g] = cat
-            if cat:
-                got += 1
+            if name:
+                unique[g] = name
+                by_name += 1
+            elif code:
+                unique[g] = code           # A フォールバック（コード）
+                by_code += 1
+            else:
+                unique[g] = None
 
             if (idx + 1) % 25 == 0:
                 logger.info("  category progress: %d/%d", idx + 1, len(goods_ids))
@@ -221,4 +169,5 @@ def enrich_items_with_category(
         if unique.get(g):
             it["_category"] = unique[g]
 
-    logger.info("Category enrichment done: %d/%d products got a mid-category", got, len(goods_ids))
+    logger.info("Category enrichment done: %d by name (B), %d by code (A), of %d products",
+                by_name, by_code, len(goods_ids))
