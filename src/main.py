@@ -84,7 +84,11 @@ def run(args: argparse.Namespace) -> int:
                     json.dumps(items[0], ensure_ascii=False)[:3000],
                 )
             if args.with_category:
-                enrich_items_with_category(items, request_interval_seconds=interval)
+                enrich_items_with_category(
+                    items,
+                    request_interval_seconds=interval,
+                    category_limit=args.category_limit,
+                )
             rows = [
                 normalize_goods(
                     g,
@@ -195,6 +199,12 @@ def main() -> None:
         "--with-category",
         action="store_true",
         help="全体ランキングの各商品の詳細ページを開いて中カテゴリを取得（重い）",
+    )
+    p.add_argument(
+        "--category-limit",
+        type=int,
+        default=0,
+        help="中カテゴリ取得の対象を先頭N商品に制限（0=全件・動作確認用）",
     )
     args = p.parse_args()
     sys.exit(run(args))
