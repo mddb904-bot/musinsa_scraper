@@ -117,7 +117,7 @@ def normalize_goods(
         "rank": rank,
         "product_id": str(raw.get("goodsNo") or ""),
         "product_name": raw.get("goodsName"),
-        "category": None,  # 商品オブジェクトに直接フィールドなし
+        "category": raw.get("_category"),  # 中カテゴリ。--with-category 時のみ付与、無ければ None
         "image_url": image_url,
         "price": _to_int(raw.get("price")),
         "normal_price": _to_int(raw.get("normalPrice")),

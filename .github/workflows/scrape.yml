@@ -43,6 +43,12 @@ on:
         default: 'false'
         type: choice
         options: ['false', 'true']
+      with_category:
+        description: '全体ランキングの各商品の中カテゴリを取得（商品ごとに詳細ページを開く・重い）'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
 
 jobs:
   scrape:
@@ -86,6 +92,7 @@ jobs:
           if [ "${{ github.event.inputs.skip_brand }}" = "true" ]; then ARGS="$ARGS --skip-brand"; fi
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
           if [ "${{ github.event.inputs.dump_sample }}" = "true" ]; then ARGS="$ARGS --dump-sample"; fi
+          if [ "${{ github.event.inputs.with_category }}" = "true" ]; then ARGS="$ARGS --with-category"; fi
           python -m src.main $ARGS
 
       - name: Cleanup credentials
