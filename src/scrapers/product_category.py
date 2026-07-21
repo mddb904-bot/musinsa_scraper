@@ -152,12 +152,21 @@ def _resolve_category_name(page, code: str, timeout_ms: int, log_detail: bool) -
     if log_detail:
         logger.info("  code %s: breadcrumb=%s, title=%r, h1=%r", code, breadcrumb, title[:60], h1[:40])
 
+    _JUNK = {"", "GLOBAL MUSINSA", "MUSINSA", "MUSINSA日本"}
+
+    def _clean(s: str) -> str | None:
+        s = (s or "").strip()
+        # 'トップス特集 - 韓国人気ファッション通販 | MUSINSA日本' → 先頭セグメント
+        s = re.split(r"\s*[|｜\-–—:／/]\s*", s)[0].strip()
+        s = re.sub(r"(特集|一覧|ランキング)$", "", s).strip()
+        return s if s and s.upper() not in {j.upper() for j in _JUNK} and len(s) <= 30 else None
+
+    # 優先: パンくず末端 > title の先頭セグメント > h1
     name = _pick_mid_from_breadcrumb(breadcrumb)
-    if not name and h1 and len(h1) <= 30:
-        name = h1
-    if not name and title:
-        # サイト名等のサフィックスを除去
-        name = re.split(r"[|\-–—:｜]", title)[0].strip() or None
+    if not name:
+        name = _clean(title)
+    if not name:
+        name = _clean(h1)
     return name
 
 
