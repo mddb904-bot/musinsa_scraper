@@ -49,6 +49,11 @@ on:
         default: 'false'
         type: choice
         options: ['false', 'true']
+      category_limit:
+        description: '中カテゴリ取得を先頭N商品に制限（動作確認用。0=全件）'
+        required: false
+        default: '0'
+        type: string
 
 jobs:
   scrape:
@@ -93,6 +98,7 @@ jobs:
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
           if [ "${{ github.event.inputs.dump_sample }}" = "true" ]; then ARGS="$ARGS --dump-sample"; fi
           if [ "${{ github.event.inputs.with_category }}" = "true" ]; then ARGS="$ARGS --with-category"; fi
+          if [ -n "${{ github.event.inputs.category_limit }}" ] && [ "${{ github.event.inputs.category_limit }}" != "0" ]; then ARGS="$ARGS --category-limit ${{ github.event.inputs.category_limit }}"; fi
           python -m src.main $ARGS
 
       - name: Cleanup credentials

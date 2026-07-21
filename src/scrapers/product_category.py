@@ -1,20 +1,21 @@
 """商品の中カテゴリを、商品詳細ページを開いて取得する（方法A）。
 
-ランキングAPIのレスポンスには中カテゴリが含まれないため、各商品の
-詳細ページ (/jp/goods/{goodsNo}) を開き、ページ読み込み時に発火する
-JSON レスポンスから「カテゴリ情報（category2Depth 相当＝中カテゴリ）」を
-抽出する。重い処理（商品ごとに1ページ開く）なので、呼び出し側の
-フラグで on/off する想定。
+ランキングAPIのレスポンスには中カテゴリが含まれず、商品ページでは
+カテゴリがサーバー側でHTMLに埋め込まれる（SSR: isCategorySsrEnabled）ため、
+別JSON通信の傍受では取れない。そこで商品詳細ページに埋め込まれた
+`__NEXT_DATA__`（および application/json スクリプト）を読み、
+その中からカテゴリ名（category2Depth 相当＝中カテゴリ）を抽出する。
+パンくず(breadcrumb)のテキストもフォールバック兼確認用に拾う。
 
-styled-components 等でクラス名が変わっても壊れないよう、JSON のキー名に
-"categor" を含む項目を再帰的に探し、中カテゴリらしきものを選ぶ方式にしている。
-最初の数商品については見つかった候補をログ出力し、実データで確認できるようにする。
+重い処理（商品ごとに1ページ開く）なので、呼び出し側のフラグで on/off する。
+最初の数商品については候補をログ出力し、実データで項目名を確認できるようにする。
 """
 from __future__ import annotations
 
+import json
 import logging
 
-from playwright.sync_api import sync_playwright, Response
+from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -24,52 +25,116 @@ _USER_AGENT = (
 )
 
 
-def _find_category_fields(obj, path: str = "") -> list[tuple[str, str, object]]:
-    """キー名に 'categor' を含む（値がスカラーの）項目を (path, key, value) で列挙する。"""
-    hits: list[tuple[str, str, object]] = []
+def _walk_scalars(obj, path: str = ""):
+    """ネストした dict/list を再帰的に走査し、(path, key, value) を列挙する。"""
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if (
-                "categor" in str(k).lower()
-                and not isinstance(v, (dict, list))
-                and v not in (None, "")
-            ):
-                hits.append((path, str(k), v))
-            hits.extend(_find_category_fields(v, f"{path}.{k}"))
+            if isinstance(v, (dict, list)):
+                yield from _walk_scalars(v, f"{path}.{k}")
+            else:
+                yield (path, str(k), v)
     elif isinstance(obj, list):
-        for i, v in enumerate(obj[:10]):
-            hits.extend(_find_category_fields(v, f"{path}[{i}]"))
+        for i, v in enumerate(obj):
+            if isinstance(v, (dict, list)):
+                yield from _walk_scalars(v, f"{path}[{i}]")
+
+
+def _looks_like_category_name(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    s = value.strip()
+    if not s or len(s) > 30:
+        return False
+    if s.lower() in ("true", "false", "null", "none"):
+        return False
+    if s.startswith(("http", "#", "/")) or "/" in s or "." in s:
+        return False
+    return True
+
+
+def _category_candidates(data) -> list[tuple[str, str, str]]:
+    """パス or キー名に 'categor' を含み、値がカテゴリ名らしいものを列挙する。"""
+    hits: list[tuple[str, str, str]] = []
+    for path, key, value in _walk_scalars(data):
+        if not _looks_like_category_name(value):
+            continue
+        if "categor" in key.lower() or "categor" in path.lower():
+            hits.append((path, key, value.strip()))
     return hits
 
 
-def _score_field(key: str) -> int:
-    """中カテゴリ（第2階層の名称）らしさをスコア化する。"""
-    kl = key.lower()
+def _score(path: str, key: str) -> int:
+    t = f"{path}.{key}".lower()
     s = 0
-    if any(t in kl for t in ("2depth", "depth2", "category2", "middle", "second")):
+    if any(x in t for x in ("2depth", "depth2", "category2", "middle", "second", "medium")):
         s += 100
-    if "name" in kl:
-        s += 10
-    if any(t in kl for t in ("1depth", "depth1", "category1", "large", "first")):
+    if "name" in t:
+        s += 20
+    if any(x in t for x in ("3depth", "depth3", "category3", "small")):
+        s += 5
+    if any(x in t for x in ("1depth", "depth1", "category1", "large", "first")):
         s -= 50
-    if "brand" in kl:
+    if "brand" in t:
         s -= 1000
-    if "code" in kl or "id" in kl:
-        s -= 20
+    if any(x in t for x in ("code", "id", "url", "link", "version", "enabled", "menu", "yn", "count")):
+        s -= 200
     return s
 
 
-def _pick_mid_category(fields: list[tuple[str, str, object]]) -> str | None:
-    """候補から中カテゴリ（category2Depth 相当）の名称を選ぶ。"""
-    named = [
-        (p, k, v)
-        for (p, k, v) in fields
-        if isinstance(v, str) and not v.isdigit()
-    ]
-    if not named:
+def _pick_mid_category(candidates: list[tuple[str, str, str]]) -> str | None:
+    if not candidates:
         return None
-    best = max(named, key=lambda item: _score_field(item[1]))
-    return best[2] if _score_field(best[1]) > -50 else None
+    best = max(candidates, key=lambda c: _score(c[0], c[1]))
+    return best[2] if _score(best[0], best[1]) > 0 else None
+
+
+def _extract_from_page(page, log_detail: bool) -> str | None:
+    """現在開いているページから中カテゴリ名を抽出する。"""
+    # 1) __NEXT_DATA__ と application/json スクリプトを集める
+    blobs: list[str] = []
+    try:
+        blobs = page.evaluate(
+            """() => {
+                const out = [];
+                const nd = document.getElementById('__NEXT_DATA__');
+                if (nd && nd.textContent) out.push(nd.textContent);
+                document.querySelectorAll('script[type="application/json"]').forEach(s => {
+                    if (s.textContent) out.push(s.textContent);
+                });
+                return out;
+            }"""
+        ) or []
+    except Exception:
+        blobs = []
+
+    candidates: list[tuple[str, str, str]] = []
+    for blob in blobs:
+        try:
+            data = json.loads(blob)
+        except Exception:
+            continue
+        candidates.extend(_category_candidates(data))
+
+    # 2) パンくず(breadcrumb)候補テキスト（フォールバック兼確認用）
+    crumbs = []
+    try:
+        crumbs = page.evaluate(
+            """() => {
+                const sel = 'nav a, [class*="readcrumb" i] a, [class*="readcrumb" i] li, ol li a';
+                return Array.from(document.querySelectorAll(sel))
+                    .map(e => (e.innerText || '').trim())
+                    .filter(t => t && t.length <= 20).slice(0, 20);
+            }"""
+        ) or []
+    except Exception:
+        crumbs = []
+
+    if log_detail:
+        uniq = sorted({(p, k, v) for (p, k, v) in candidates}, key=lambda c: -_score(c[0], c[1]))
+        logger.info("  NEXT_DATA category candidates (top): %s", uniq[:12])
+        logger.info("  breadcrumb texts: %s", crumbs)
+
+    return _pick_mid_category(candidates)
 
 
 def enrich_items_with_category(
@@ -78,11 +143,12 @@ def enrich_items_with_category(
     request_interval_seconds: float = 1.0,
     timeout_ms: int = 20000,
     log_samples: int = 3,
+    category_limit: int = 0,
 ) -> None:
     """items（商品オブジェクトのリスト）に in-place で `_category`（中カテゴリ）を付与する。
 
     goodsNo で重複排除し、ユニークな商品ごとに1回だけ詳細ページを開く。
-    取得できなかった商品は `_category` を付与しない（= None のまま）。
+    category_limit > 0 の場合は先頭 N 件のユニーク商品だけを対象にする（動作確認用）。
     """
     if not items:
         return
@@ -93,52 +159,42 @@ def enrich_items_with_category(
         if g:
             unique.setdefault(g, None)
 
+    goods_ids = list(unique.keys())
+    if category_limit and category_limit > 0:
+        goods_ids = goods_ids[:category_limit]
+        logger.info("Category enrichment: LIMITED to first %d unique products (test mode)", len(goods_ids))
+
     logger.info(
-        "Category enrichment: opening %d unique product pages (of %d items)...",
-        len(unique), len(items),
+        "Category enrichment: opening %d product pages (of %d items)...",
+        len(goods_ids), len(items),
     )
-
-    captured: dict[str, list] = {"fields": []}
-
-    def on_response(response: Response) -> None:
-        try:
-            if "application/json" not in response.headers.get("content-type", ""):
-                return
-            body = response.json()
-        except Exception:
-            return
-        captured["fields"].extend(_find_category_fields(body))
 
     got = 0
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=_USER_AGENT, locale="ja-JP")
         page = context.new_page()
-        page.on("response", on_response)
 
-        for idx, g in enumerate(unique):
-            captured["fields"] = []
+        for idx, g in enumerate(goods_ids):
             url = f"https://global.musinsa.com/jp/goods/{g}?toggleCountry=jp"
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                # イベントループを回して category を含む JSON 応答を取りこぼさない
-                for _ in range(6):
-                    page.wait_for_timeout(500)
+                page.wait_for_timeout(1500)
             except Exception as e:
                 logger.warning("category fetch failed for goods %s: %s", g, e)
+                unique[g] = None
+                page.wait_for_timeout(int(request_interval_seconds * 1000))
+                continue
 
-            fields = captured["fields"]
             if idx < log_samples:
-                candidates = sorted({(k, str(v)) for (_, k, v) in fields})
-                logger.info("goods %s category candidates: %s", g, candidates[:20])
-
-            cat = _pick_mid_category(fields)
+                logger.info("goods %s:", g)
+            cat = _extract_from_page(page, log_detail=idx < log_samples)
             unique[g] = cat
             if cat:
                 got += 1
 
             if (idx + 1) % 25 == 0:
-                logger.info("  category progress: %d/%d", idx + 1, len(unique))
+                logger.info("  category progress: %d/%d", idx + 1, len(goods_ids))
             page.wait_for_timeout(int(request_interval_seconds * 1000))
 
         browser.close()
@@ -149,6 +205,6 @@ def enrich_items_with_category(
             it["_category"] = unique[g]
 
     logger.info(
-        "Category enrichment done: %d/%d unique products got a mid-category",
-        got, len(unique),
+        "Category enrichment done: %d/%d products got a mid-category",
+        got, len(goods_ids),
     )
