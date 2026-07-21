@@ -118,6 +118,49 @@ def _pick_mid_from_breadcrumb(names: list[str]) -> str | None:
     return seq[-1]  # 最も具体的なカテゴリ（＝商品の中カテゴリ）
 
 
+def _resolve_category_name(page, code: str, timeout_ms: int, log_detail: bool) -> str | None:
+    """カテゴリページ /jp/category/{code} を開いてカテゴリ名を取得する。"""
+    url = f"https://global.musinsa.com/jp/category/{code}?toggleCountry=jp"
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        page.wait_for_timeout(1500)
+    except Exception as e:
+        logger.warning("category page fetch failed for %s: %s", code, e)
+        return None
+
+    ld_texts = []
+    try:
+        ld_texts = page.evaluate(
+            """() => Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+                .map(s => s.textContent).filter(Boolean)"""
+        ) or []
+    except Exception:
+        ld_texts = []
+    breadcrumb = _extract_breadcrumb_from_ldjson(ld_texts)
+
+    title = ""
+    h1 = ""
+    try:
+        title = page.title() or ""
+        h1 = page.evaluate(
+            """() => { const h = document.querySelector('h1, h2, [class*="title" i]');
+                       return h ? (h.innerText || '').trim() : ''; }"""
+        ) or ""
+    except Exception:
+        pass
+
+    if log_detail:
+        logger.info("  code %s: breadcrumb=%s, title=%r, h1=%r", code, breadcrumb, title[:60], h1[:40])
+
+    name = _pick_mid_from_breadcrumb(breadcrumb)
+    if not name and h1 and len(h1) <= 30:
+        name = h1
+    if not name and title:
+        # サイト名等のサフィックスを除去
+        name = re.split(r"[|\-–—:｜]", title)[0].strip() or None
+    return name
+
+
 def enrich_items_with_category(
     items: list[dict],
     *,
@@ -151,14 +194,14 @@ def enrich_items_with_category(
         if m:
             seen_code["code"] = m.group(1)
 
-    by_name = 0
-    by_code = 0
+    goods_code: dict[str, str] = {}   # goodsNo -> itemCategoryCode
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=_USER_AGENT, locale="ja-JP")
         page = context.new_page()
         page.on("request", on_request)
 
+        # --- フェーズ1: 各商品ページを開いて itemCategoryCode を集める ---
         for idx, g in enumerate(goods_ids):
             seen_code["code"] = ""
             url = f"https://global.musinsa.com/jp/goods/{g}?toggleCountry=jp"
@@ -170,47 +213,41 @@ def enrich_items_with_category(
                 page.wait_for_timeout(int(request_interval_seconds * 1000))
                 continue
 
-            # ld+json（BreadcrumbList）を読む
-            ld_texts = []
-            try:
-                ld_texts = page.evaluate(
-                    """() => Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
-                        .map(s => s.textContent).filter(Boolean)"""
-                ) or []
-            except Exception:
-                ld_texts = []
-
-            breadcrumb = _extract_breadcrumb_from_ldjson(ld_texts)
-            name = _pick_mid_from_breadcrumb(breadcrumb) or _extract_product_category(ld_texts)
             code = seen_code["code"]
-
+            if code:
+                goods_code[g] = code
             if idx < log_samples:
-                logger.info("goods %s: ld+json=%d, breadcrumb=%s, product_category=%s, itemCategoryCode=%s",
-                            g, len(ld_texts), breadcrumb, _extract_product_category(ld_texts), code or "(none)")
-                if not name:
-                    # 診断: ld+json のフルスニペット
-                    for i, t in enumerate(ld_texts[:3]):
-                        logger.info("    ld+json[%d]: %s", i, t[:2500])
-
-            if name:
-                unique[g] = name
-                by_name += 1
-            elif code:
-                unique[g] = code           # A フォールバック（コード）
-                by_code += 1
-            else:
-                unique[g] = None
-
+                logger.info("goods %s: itemCategoryCode=%s", g, code or "(none)")
             if (idx + 1) % 25 == 0:
-                logger.info("  category progress: %d/%d", idx + 1, len(goods_ids))
+                logger.info("  code progress: %d/%d", idx + 1, len(goods_ids))
+            page.wait_for_timeout(int(request_interval_seconds * 1000))
+
+        # --- フェーズ2: ユニークなカテゴリコードを名前に変換（使い回し）---
+        unique_codes = sorted(set(goods_code.values()))
+        logger.info("Resolving %d unique category codes to names...", len(unique_codes))
+        code_name: dict[str, str] = {}
+        for j, code in enumerate(unique_codes):
+            name = _resolve_category_name(page, code, timeout_ms, log_detail=j < log_samples)
+            if name:
+                code_name[code] = name
             page.wait_for_timeout(int(request_interval_seconds * 1000))
 
         browser.close()
 
+    by_name = 0
+    by_code = 0
     for it in items:
         g = str(it.get("goodsNo") or "")
-        if unique.get(g):
-            it["_category"] = unique[g]
+        code = goods_code.get(g)
+        if not code:
+            continue
+        name = code_name.get(code)
+        if name:
+            it["_category"] = name
+            by_name += 1
+        else:
+            it["_category"] = code   # 名前解決に失敗したらコードのまま
+            by_code += 1
 
-    logger.info("Category enrichment done: %d by name (B), %d by code (A), of %d products",
+    logger.info("Category enrichment done: %d by name, %d by code(fallback), of %d products",
                 by_name, by_code, len(goods_ids))
