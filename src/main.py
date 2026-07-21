@@ -25,6 +25,7 @@ import yaml
 from .parser import normalize_goods
 from .scrapers.overall import fetch_overall_ranking
 from .scrapers.brand import fetch_brand_ranking
+from .scrapers.product_category import enrich_items_with_category
 from .bigquery_loader import load_rows_to_bigquery
 from .sheets_loader import load_rows_to_sheets
 from .notifier import notify_failure, notify_success
@@ -82,6 +83,8 @@ def run(args: argparse.Namespace) -> int:
                     "=== RAW overall[0] json: %s",
                     json.dumps(items[0], ensure_ascii=False)[:3000],
                 )
+            if args.with_category:
+                enrich_items_with_category(items, request_interval_seconds=interval)
             rows = [
                 normalize_goods(
                     g,
@@ -187,6 +190,11 @@ def main() -> None:
         "--dump-sample",
         action="store_true",
         help="取得した生データの先頭1件をログ出力（カテゴリ有無などの確認用）",
+    )
+    p.add_argument(
+        "--with-category",
+        action="store_true",
+        help="全体ランキングの各商品の詳細ページを開いて中カテゴリを取得（重い）",
     )
     args = p.parse_args()
     sys.exit(run(args))
