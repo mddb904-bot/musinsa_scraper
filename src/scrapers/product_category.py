@@ -1,21 +1,21 @@
 """商品の中カテゴリを、商品詳細ページを開いて取得する（方法A）。
 
-ランキングAPIのレスポンスには中カテゴリが含まれず、商品ページでは
-カテゴリがサーバー側でHTMLに埋め込まれる（SSR: isCategorySsrEnabled）ため、
-別JSON通信の傍受では取れない。そこで商品詳細ページに埋め込まれた
-`__NEXT_DATA__`（および application/json スクリプト）を読み、
-その中からカテゴリ名（category2Depth 相当＝中カテゴリ）を抽出する。
-パンくず(breadcrumb)のテキストもフォールバック兼確認用に拾う。
+ランキングAPIのレスポンスには中カテゴリが含まれないため、商品詳細ページ
+(/jp/goods/{goodsNo}) を開いて中カテゴリ（category2Depth 相当）を取得する。
+
+カテゴリ情報がページのどこ（傍受JSON / 埋め込み __NEXT_DATA__ 等）に入るか
+確定させるため、最初の数商品では「カテゴリを含むデータ源の生スニペット」を
+ログ出力する診断モードを備える。抽出は、キー/パスに 'categor' を含み値が
+カテゴリ名らしいスカラーを候補化し、中カテゴリらしさでスコア選択する。
 
 重い処理（商品ごとに1ページ開く）なので、呼び出し側のフラグで on/off する。
-最初の数商品については候補をログ出力し、実データで項目名を確認できるようにする。
 """
 from __future__ import annotations
 
 import json
 import logging
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, Response
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,6 @@ _USER_AGENT = (
 
 
 def _walk_scalars(obj, path: str = ""):
-    """ネストした dict/list を再帰的に走査し、(path, key, value) を列挙する。"""
     if isinstance(obj, dict):
         for k, v in obj.items():
             if isinstance(v, (dict, list)):
@@ -53,7 +52,6 @@ def _looks_like_category_name(value) -> bool:
 
 
 def _category_candidates(data) -> list[tuple[str, str, str]]:
-    """パス or キー名に 'categor' を含み、値がカテゴリ名らしいものを列挙する。"""
     hits: list[tuple[str, str, str]] = []
     for path, key, value in _walk_scalars(data):
         if not _looks_like_category_name(value):
@@ -88,67 +86,20 @@ def _pick_mid_category(candidates: list[tuple[str, str, str]]) -> str | None:
     return best[2] if _score(best[0], best[1]) > 0 else None
 
 
-def _extract_from_page(page, log_detail: bool) -> str | None:
-    """現在開いているページから中カテゴリ名を抽出する。"""
-    # 1) __NEXT_DATA__ と application/json スクリプトを集める
-    blobs: list[str] = []
-    try:
-        blobs = page.evaluate(
-            """() => {
-                const out = [];
-                const nd = document.getElementById('__NEXT_DATA__');
-                if (nd && nd.textContent) out.push(nd.textContent);
-                document.querySelectorAll('script[type="application/json"]').forEach(s => {
-                    if (s.textContent) out.push(s.textContent);
-                });
-                return out;
-            }"""
-        ) or []
-    except Exception:
-        blobs = []
-
-    candidates: list[tuple[str, str, str]] = []
-    for blob in blobs:
-        try:
-            data = json.loads(blob)
-        except Exception:
-            continue
-        candidates.extend(_category_candidates(data))
-
-    # 2) パンくず(breadcrumb)候補テキスト（フォールバック兼確認用）
-    crumbs = []
-    try:
-        crumbs = page.evaluate(
-            """() => {
-                const sel = 'nav a, [class*="readcrumb" i] a, [class*="readcrumb" i] li, ol li a';
-                return Array.from(document.querySelectorAll(sel))
-                    .map(e => (e.innerText || '').trim())
-                    .filter(t => t && t.length <= 20).slice(0, 20);
-            }"""
-        ) or []
-    except Exception:
-        crumbs = []
-
-    if log_detail:
-        uniq = sorted({(p, k, v) for (p, k, v) in candidates}, key=lambda c: -_score(c[0], c[1]))
-        logger.info("  NEXT_DATA category candidates (top): %s", uniq[:12])
-        logger.info("  breadcrumb texts: %s", crumbs)
-
-    return _pick_mid_category(candidates)
-
-
 def enrich_items_with_category(
     items: list[dict],
     *,
     request_interval_seconds: float = 1.0,
     timeout_ms: int = 20000,
-    log_samples: int = 3,
+    log_samples: int = 2,
     category_limit: int = 0,
 ) -> None:
-    """items（商品オブジェクトのリスト）に in-place で `_category`（中カテゴリ）を付与する。
+    """items に in-place で `_category`（中カテゴリ）を付与する。
 
-    goodsNo で重複排除し、ユニークな商品ごとに1回だけ詳細ページを開く。
-    category_limit > 0 の場合は先頭 N 件のユニーク商品だけを対象にする（動作確認用）。
+    データ源（傍受JSON / __NEXT_DATA__ / application/json スクリプト）を横断して
+    カテゴリ候補を集める。最初の log_samples 件では、カテゴリを含む生データの
+    スニペットをログ出力して項目位置を特定できるようにする。
+    category_limit > 0 なら先頭N件のユニーク商品だけを対象（動作確認用）。
     """
     if not items:
         return
@@ -169,26 +120,82 @@ def enrich_items_with_category(
         len(goods_ids), len(items),
     )
 
+    # 傍受した JSON レスポンス (url, parsed_body, raw_text) を貯める
+    responses: list[tuple[str, object, str]] = []
+
+    def on_response(response: Response) -> None:
+        try:
+            if "application/json" not in response.headers.get("content-type", ""):
+                return
+            text = response.text()
+            body = json.loads(text)
+        except Exception:
+            return
+        responses.append((response.url, body, text))
+
     got = 0
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=_USER_AGENT, locale="ja-JP")
         page = context.new_page()
+        page.on("response", on_response)
 
         for idx, g in enumerate(goods_ids):
+            responses.clear()
             url = f"https://global.musinsa.com/jp/goods/{g}?toggleCountry=jp"
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 page.wait_for_timeout(1500)
             except Exception as e:
                 logger.warning("category fetch failed for goods %s: %s", g, e)
-                unique[g] = None
                 page.wait_for_timeout(int(request_interval_seconds * 1000))
                 continue
 
+            # 埋め込み JSON (__NEXT_DATA__ / application/json)
+            embedded: list[str] = []
+            try:
+                embedded = page.evaluate(
+                    """() => {
+                        const out = [];
+                        const nd = document.getElementById('__NEXT_DATA__');
+                        if (nd && nd.textContent) out.push(nd.textContent);
+                        document.querySelectorAll('script[type="application/json"]').forEach(s => {
+                            if (s.textContent) out.push(s.textContent);
+                        });
+                        return out;
+                    }"""
+                ) or []
+            except Exception:
+                embedded = []
+
+            # 全データ源から候補を集める
+            sources: list[tuple[str, object]] = [(u, b) for (u, b, _t) in responses]
+            for i, blob in enumerate(embedded):
+                try:
+                    sources.append((f"embedded[{i}]", json.loads(blob)))
+                except Exception:
+                    pass
+
+            candidates: list[tuple[str, str, str]] = []
+            for _src, body in sources:
+                candidates.extend(_category_candidates(body))
+
+            # --- 診断ログ: 最初の数件だけ ---
             if idx < log_samples:
-                logger.info("goods %s:", g)
-            cat = _extract_from_page(page, log_detail=idx < log_samples)
+                logger.info("goods %s: %d json responses, %d embedded json blobs",
+                            g, len(responses), len(embedded))
+                # カテゴリという語を含むデータ源の生スニペット
+                for src_name, body, text in [(u, b, t) for (u, b, t) in responses]:
+                    if "categor" in text.lower():
+                        logger.info("  [resp %s] snippet: %s",
+                                    src_name.split("?")[0][-60:], text[:1200])
+                for i, blob in enumerate(embedded):
+                    if "categor" in blob.lower():
+                        logger.info("  [embedded %d] snippet: %s", i, blob[:1200])
+                logger.info("  category candidates: %s",
+                            sorted({(k, v) for (_p, k, v) in candidates})[:20])
+
+            cat = _pick_mid_category(candidates)
             unique[g] = cat
             if cat:
                 got += 1
@@ -204,7 +211,4 @@ def enrich_items_with_category(
         if unique.get(g):
             it["_category"] = unique[g]
 
-    logger.info(
-        "Category enrichment done: %d/%d products got a mid-category",
-        got, len(goods_ids),
-    )
+    logger.info("Category enrichment done: %d/%d products got a mid-category", got, len(goods_ids))
