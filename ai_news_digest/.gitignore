@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 出力物はコミットしない
+dist/
+*.html
+!sample_digest.html
+
+# 認証情報を絶対に入れない
+service_account.json
+*.pem
+.env

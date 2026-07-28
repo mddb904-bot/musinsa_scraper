@@ -1,0 +1,49 @@
+name: setup
+
+# 手動実行専用。ブラウザの Actions タブから動かす。
+# ローカルに Python 環境を作らなくてもセットアップできるようにするためのもの。
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "実行する内容"
+        type: choice
+        options:
+          - check-sources
+          - create-tabs
+        default: check-sources
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: チェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 依存パッケージ
+        run: pip install -r requirements.txt
+
+      - name: フィード疎通確認
+        if: inputs.action == 'check-sources'
+        env:
+          TZ: Asia/Tokyo
+        run: python -m src.setup_sheet --check
+
+      - name: タブ作成
+        if: inputs.action == 'create-tabs'
+        env:
+          AINEWS_SA_JSON: ${{ secrets.AINEWS_SA_JSON }}
+          TZ: Asia/Tokyo
+        run: python -m src.setup_sheet --yes
