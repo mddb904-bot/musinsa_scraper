@@ -102,6 +102,18 @@ def _smart_append(
         return 0
 
     end_row = start_row + len(rows_values) - 1
+
+    # グリッド上限対策: 追記先がシートの行数/列数を超える場合は先に拡張する
+    needed_cols = _DATA_COL_START + len(columns_jp) - 1
+    if end_row > ws.row_count or needed_cols > ws.col_count:
+        new_rows = max(end_row + 200, ws.row_count)  # 余裕を持たせて毎回の拡張を避ける
+        new_cols = max(needed_cols, ws.col_count)
+        logger.info(
+            "Sheet '%s': resizing grid to rows=%d, cols=%d (was rows=%d, cols=%d)",
+            ws.title, new_rows, new_cols, ws.row_count, ws.col_count,
+        )
+        ws.resize(rows=new_rows, cols=new_cols)
+
     range_str = f"B{start_row}:{end_col}{end_row}"
     ws.update(range_str, rows_values, value_input_option="RAW")
     logger.info(
