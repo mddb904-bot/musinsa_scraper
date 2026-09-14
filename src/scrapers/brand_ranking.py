@@ -40,10 +40,6 @@ _USER_AGENT = (
 
 _LIST_PAGE_URL = "https://global.musinsa.com/jp/trending/brands?toggleCountry=jp"
 
-# APIレスポンスを捕捉するかの判定に使う、URLの緩いマーカー。
-# v2固定をやめ、brand/trending/ranking を含むJSONっぽいレスポンスを広く拾う。
-_CANDIDATE_URL_RE = re.compile(r"(brand|trending|ranking)", re.IGNORECASE)
-
 # --- ブランド要素のキー名揺れ対応(優先順に探す) ---
 _RANK_KEYS = ("rank", "ranking", "rankNo", "rank_no", "rankingNo")
 _ID_KEYS = ("id", "brandId", "brand_id", "brandCode", "brand_code", "code", "slug")
@@ -264,28 +260,41 @@ def fetch_brand_ranking_list(
     """
     # 捕捉したAPIレスポンス候補: (url, parsed_json)
     candidates: list[tuple[str, object]] = []
-    # 診断用: 見えたAPIっぽいURL一覧(本文パース可否問わず)
-    seen_urls: list[str] = []
+    # 診断用: 見えた XHR/fetch リクエスト一覧 (rtype, url, content-type)
+    seen_requests: list[tuple[str, str, str]] = []
 
     def on_response(response: Response) -> None:
         url = response.url
         try:
-            if not _CANDIDATE_URL_RE.search(url):
-                return
-            seen_urls.append(url)
+            req = response.request
+            rtype = req.resource_type if req is not None else ""
+        except Exception:  # noqa: BLE001
+            rtype = ""
+        try:
             ctype = (response.headers or {}).get("content-type", "")
-            # JSONっぽいものだけ本文を読む(HTML/画像等は無視)
-            if "json" not in ctype.lower() and not url.endswith(".json"):
-                # content-type が曖昧でも一応 json() を試す(失敗は無視)
-                pass
+        except Exception:  # noqa: BLE001
+            ctype = ""
+
+        # 診断: XHR/fetch は URL を全部記録しておく(新APIの特定に使う)
+        if rtype in ("xhr", "fetch"):
+            seen_requests.append((rtype, url, ctype))
+
+        # JSONっぽいレスポンスは URL パスに依存せず本文を読み、ブランド一覧を探す。
+        # (APIが別名パスや別ホストへ移動していても捕捉できるようにする)
+        is_jsonish = (
+            "json" in ctype.lower() or rtype in ("xhr", "fetch") or url.endswith(".json")
+        )
+        if not is_jsonish:
+            return
+        try:
             body = response.json()
-        except Exception:
+        except Exception:  # noqa: BLE001
             return
         found = _find_brand_list(body)
         if found and _score_brand_list(found) > 0:
             candidates.append((url, found))
             logger.info(
-                "Captured brand list: %d brands from %s", len(found), url[:120]
+                "Captured brand list: %d brands from %s", len(found), url[:150]
             )
 
     with sync_playwright() as p:
@@ -329,6 +338,7 @@ def fetch_brand_ranking_list(
         brand_list = candidates[0][1] if candidates else None
 
         # フォールバック: XHRで取れなければ、HTML埋め込みJSONから抽出を試みる
+        html = ""
         if not brand_list:
             logger.warning(
                 "No brand list captured via XHR; trying HTML-embedded JSON fallback"
@@ -345,7 +355,11 @@ def fetch_brand_ranking_list(
             logger.error(
                 "brandList not captured (page structure or API may have changed)"
             )
-            _log_diagnostics(seen_urls)
+            try:
+                title = page.title()
+            except Exception:  # noqa: BLE001
+                title = "?"
+            _log_diagnostics(seen_requests, html, title)
             brand_list = []
 
         results: list[dict] = [_map_brand_item(b) for b in brand_list if isinstance(b, dict)]
@@ -382,18 +396,46 @@ def _rank_sort_key(rank) -> int:
         return 9999
 
 
-def _log_diagnostics(seen_urls: list[str]) -> None:
-    """失敗時に、実際に見えたAPIっぽいURL一覧を診断ログとして出力する。"""
-    uniq: list[str] = []
-    for u in seen_urls:
-        if u not in uniq:
-            uniq.append(u)
+def _log_diagnostics(
+    seen_requests: list[tuple[str, str, str]],
+    html: str,
+    title: str,
+) -> None:
+    """失敗時に、実際に叩かれた XHR/fetch とHTMLの状態を診断ログに出す。
+
+    ローカルからサイトへ到達できない環境では、このログが新しいAPI構造や
+    SSR化・ボットブロックを特定する唯一の手がかりになる。
+    """
+    # --- 1) XHR/fetch の全URL(重複除去) ---
+    uniq: list[tuple[str, str, str]] = []
+    seen = set()
+    for rtype, url, ctype in seen_requests:
+        if url in seen:
+            continue
+        seen.add(url)
+        uniq.append((rtype, url, ctype))
     if not uniq:
         logger.error(
-            "DIAGNOSTIC: no brand/trending/ranking API responses were observed at all. "
-            "The page may block headless browsers, or the data is server-rendered."
+            "DIAGNOSTIC: no XHR/fetch requests were observed at all. "
+            "The page likely renders data server-side or blocks headless browsers."
         )
-        return
-    logger.error("DIAGNOSTIC: observed %d candidate API URL(s):", len(uniq))
-    for u in uniq[:40]:
-        logger.error("  - %s", u[:200])
+    else:
+        logger.error("DIAGNOSTIC: observed %d XHR/fetch request(s):", len(uniq))
+        for rtype, url, ctype in uniq[:60]:
+            logger.error("  - [%s] %s (%s)", rtype, url[:220], ctype[:40])
+
+    # --- 2) HTML側のシグナル(データが埋め込まれているか/ブロックされていないか) ---
+    html = html or ""
+    lower = html.lower()
+    signals = {
+        "html_len": len(html),
+        "title": (title or "")[:80],
+        "has___NEXT_DATA__": "__next_data__" in lower,
+        "has_next_f_stream": "self.__next_f" in html,
+        "has_brandList_literal": '"brandlist"' in lower,
+        "count_/brands/": html.count("/brands/"),
+        "looks_blocked": any(
+            k in lower for k in ("captcha", "are you a robot", "access denied", "px-captcha", "perimeterx", "cloudflare")
+        ),
+    }
+    logger.error("DIAGNOSTIC: HTML signals: %s", signals)
