@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 
@@ -39,6 +40,65 @@ _USER_AGENT = (
 )
 
 _LIST_PAGE_URL = "https://global.musinsa.com/jp/trending/brands?toggleCountry=jp"
+
+# MUSINSAはCloudflareのBot保護(マネージドチャレンジ)を有効化しており、素の
+# ヘッドレスChromiumは「Attention Required!」画面で弾かれる。実ブラウザ相当に
+# 振る舞う(=ヘッドフル+自動化フィンガープリント除去)ことでチャレンジの自動通過を狙う。
+#   - CIでは xvfb 上でヘッドフル起動する(ワークフロー側で xvfb-run)。
+#   - BRAND_HEADLESS=1 を指定した場合のみヘッドレス(デバッグ用)。
+_HEADLESS = os.environ.get("BRAND_HEADLESS", "0").lower() not in ("", "0", "false", "no")
+
+_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--start-maximized",
+]
+
+# 自動化検知を弱めるための初期化スクリプト(navigator.webdriver 等を実ブラウザ風に)
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP','ja','en-US','en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+window.chrome = window.chrome || { runtime: {} };
+try {
+  const _q = window.navigator.permissions && window.navigator.permissions.query;
+  if (_q) {
+    window.navigator.permissions.query = (p) =>
+      (p && p.name === 'notifications')
+        ? Promise.resolve({ state: Notification.permission })
+        : _q(p);
+  }
+} catch (e) {}
+"""
+
+_EXTRA_HEADERS = {
+    "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "sec-ch-ua": '"Chromium";v="120", "Not(A:Brand";v="24", "Google Chrome";v="120"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def _looks_like_challenge(page) -> bool:
+    """Cloudflareのチャレンジ/ブロック画面が表示中かを判定する。"""
+    try:
+        title = (page.title() or "").lower()
+    except Exception:  # noqa: BLE001
+        title = ""
+    if "attention required" in title or "just a moment" in title:
+        return True
+    try:
+        html = (page.content() or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return (
+        "cdn-cgi/challenge-platform" in html
+        or "cf-chl" in html
+        or "checking your browser" in html
+    )
 
 # --- ブランド要素のキー名揺れ対応(優先順に探す) ---
 _RANK_KEYS = ("rank", "ranking", "rankNo", "rank_no", "rankingNo")
@@ -298,27 +358,57 @@ def fetch_brand_ranking_list(
             )
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=_HEADLESS, args=_LAUNCH_ARGS)
         context = browser.new_context(
             user_agent=_USER_AGENT,
             locale="ja-JP",
+            timezone_id="Asia/Tokyo",
             viewport={"width": 1280, "height": 1800},
+            extra_http_headers=_EXTRA_HEADERS,
         )
+        # 自動化フィンガープリントを弱める(全ページ共通で先に注入)
+        try:
+            context.add_init_script(_STEALTH_JS)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("add_init_script failed: %s", e)
         page = context.new_page()
         page.on("response", on_response)
 
-        logger.info("Loading brand ranking page: %s", _LIST_PAGE_URL)
+        logger.info(
+            "Loading brand ranking page (headless=%s): %s", _HEADLESS, _LIST_PAGE_URL
+        )
         try:
             page.goto(_LIST_PAGE_URL, wait_until="domcontentloaded", timeout=timeout_ms)
         except Exception as e:
             logger.warning("page.goto: %s", e)
+
+        # Cloudflareのマネージドチャレンジが出ている場合、実ブラウザなら数秒〜十数秒で
+        # 自動通過して本来のページに遷移する。通過(またはデータ捕捉)まで待つ。
+        if _looks_like_challenge(page):
+            logger.warning("Cloudflare challenge detected; waiting for auto clearance...")
+            for _ in range(40):  # 最長 ~40秒
+                if candidates or not _looks_like_challenge(page):
+                    break
+                page.wait_for_timeout(1000)
+            if _looks_like_challenge(page) and not candidates:
+                logger.warning("Challenge still present after wait; reloading once")
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("reload failed: %s", e)
+                for _ in range(20):
+                    if candidates or not _looks_like_challenge(page):
+                        break
+                    page.wait_for_timeout(1000)
+            if not _looks_like_challenge(page):
+                logger.info("Cloudflare challenge cleared")
 
         # APIレスポンスが傍受されるまで待つ。
         # 注意: Playwright sync API では time.sleep() 中は response イベントが
         # ディスパッチされない(Python側のイベントループが回らない)ため、
         # ブラウザが応答を受信済みでも on_response が発火しない。
         # page.wait_for_timeout() はイベントループを回すので、待機はこちらを使う。
-        for _ in range(20):
+        for _ in range(30):  # 最長 ~15秒
             if candidates:
                 break
             page.wait_for_timeout(500)
