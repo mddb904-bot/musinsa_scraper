@@ -116,21 +116,32 @@ def _first_key(d: dict, keys: tuple[str, ...]):
     return None
 
 
+def _as_int(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _looks_like_brand_item(d) -> bool:
     """dict が「ブランドランキングの1件」らしいかを判定する。
 
-    商品(goods)要素と区別するため、goodsNo/goodsName を持つものは除外する。
-    名前系キーがあり、かつ 順位系 or ブランドID系 のどちらかを持てばブランドとみなす。
+    国選択メニュー(日本/JP等)や多言語リソースといった“おとり配列”を弾くため、
+    次の決定的シグナルのどちらかを要求する:
+      - ブランドページURL(landingUrl等に "/brands/" を含む)、または
+      - 数値の順位(rank)を持つ
+    加えて名前系キーが必要。商品(goods)要素は除外する。
     """
     if not isinstance(d, dict):
         return False
     if any(k in d for k in _PRODUCT_MARKER_KEYS):
         return False
-    has_name = _first_key(d, _NAME_KEYS) is not None
-    has_rank_or_id = (
-        _first_key(d, _RANK_KEYS) is not None or _first_key(d, _ID_KEYS) is not None
-    )
-    return has_name and has_rank_or_id
+    if _first_key(d, _NAME_KEYS) is None:
+        return False
+    url = _first_key(d, _URL_KEYS)
+    is_brand_url = isinstance(url, str) and "/brands/" in url
+    has_numeric_rank = _as_int(_first_key(d, _RANK_KEYS)) is not None
+    return is_brand_url or has_numeric_rank
 
 
 def _score_brand_list(lst) -> int:
@@ -382,33 +393,45 @@ def fetch_brand_ranking_list(
         except Exception as e:
             logger.warning("page.goto: %s", e)
 
-        # Cloudflareのマネージドチャレンジが出ている場合、実ブラウザなら数秒〜十数秒で
-        # 自動通過して本来のページに遷移する。通過(またはデータ捕捉)まで待つ。
+        # Cloudflareのマネージドチャレンジが出ている場合、実ブラウザなら数十秒で
+        # 自動通過して本来のページに遷移する。まずチャレンジ通過だけを待つ
+        # (ここでデータを待たない — 通過に時間を使い切って本命APIを取り逃さないため)。
         if _looks_like_challenge(page):
             logger.warning("Cloudflare challenge detected; waiting for auto clearance...")
-            for _ in range(40):  # 最長 ~40秒
-                if candidates or not _looks_like_challenge(page):
+            for _ in range(45):  # 最長 ~45秒
+                if not _looks_like_challenge(page):
                     break
                 page.wait_for_timeout(1000)
-            if _looks_like_challenge(page) and not candidates:
+            if _looks_like_challenge(page):
                 logger.warning("Challenge still present after wait; reloading once")
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("reload failed: %s", e)
-                for _ in range(20):
-                    if candidates or not _looks_like_challenge(page):
+                for _ in range(30):
+                    if not _looks_like_challenge(page):
                         break
                     page.wait_for_timeout(1000)
             if not _looks_like_challenge(page):
                 logger.info("Cloudflare challenge cleared")
+            else:
+                logger.error("Cloudflare challenge NOT cleared (likely IP reputation)")
 
-        # APIレスポンスが傍受されるまで待つ。
+        # チャレンジ通過後に、ブランドランキングAPIを確実に発火させるため
+        # ページを開き直す(cf_clearance クッキー取得済みなので今度は本ページが出る)。
+        # 直近のナビゲーションでまだブランド候補を取れていない場合のみ。
+        if not candidates and not _looks_like_challenge(page):
+            try:
+                logger.info("Re-navigating to trigger the brand ranking API...")
+                page.goto(_LIST_PAGE_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("re-navigation failed: %s", e)
+
+        # APIレスポンス(本命のブランド一覧)が傍受されるまで待つ。フル予算で待つ。
         # 注意: Playwright sync API では time.sleep() 中は response イベントが
         # ディスパッチされない(Python側のイベントループが回らない)ため、
-        # ブラウザが応答を受信済みでも on_response が発火しない。
-        # page.wait_for_timeout() はイベントループを回すので、待機はこちらを使う。
-        for _ in range(30):  # 最長 ~15秒
+        # page.wait_for_timeout() で待つ(イベントループが回る)。
+        for _ in range(40):  # 最長 ~20秒
             if candidates:
                 break
             page.wait_for_timeout(500)
@@ -420,12 +443,18 @@ def fetch_brand_ranking_list(
                 page.wait_for_timeout(2000)
             except Exception:
                 pass
-            for _ in range(10):
+            for _ in range(20):
                 if candidates:
                     break
                 page.wait_for_timeout(500)
 
-        brand_list = candidates[0][1] if candidates else None
+        # 複数候補が取れた場合は、最も件数の多い(=本命ランキングらしい)配列を採用。
+        brand_list = None
+        if candidates:
+            best_url, brand_list = max(candidates, key=lambda c: len(c[1]))
+            logger.info(
+                "Selected brand list: %d brands from %s", len(brand_list), best_url[:150]
+            )
 
         # フォールバック: XHRで取れなければ、HTML埋め込みJSONから抽出を試みる
         html = ""
