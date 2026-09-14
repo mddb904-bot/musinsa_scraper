@@ -4,13 +4,88 @@
 """
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import random
+import time
 from typing import Iterable
 
 import gspread
+import requests
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 一時的なAPIエラーのリトライ (Google側の 503/500/429 等を吸収)
+# ============================================================
+
+# リトライ対象とするHTTPステータス(サーバー側の一時的な不調・混雑)
+_TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+# 総試行回数(初回 + リトライ)。既定5回 = 最大4回リトライ。
+_MAX_ATTEMPTS = int(os.environ.get("SHEETS_MAX_RETRIES", "5"))
+# バックオフの基準秒数。2 → 2, 4, 8, 16秒 と指数的に待つ。
+_BASE_DELAY = float(os.environ.get("SHEETS_RETRY_BASE_DELAY", "2"))
+
+
+def _is_transient(exc: Exception) -> bool:
+    """一時的(=再試行で回復し得る)エラーかどうかを判定する。"""
+    if isinstance(exc, gspread.exceptions.APIError):
+        try:
+            return exc.response.status_code in _TRANSIENT_STATUS
+        except Exception:  # noqa: BLE001 - response が無い等は非一時扱い
+            return False
+    # ネットワークの瞬断・タイムアウトも一時的として扱う
+    return isinstance(
+        exc,
+        (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ),
+    )
+
+
+def _retry_transient(func):
+    """gspreadのHTTP呼び出しを一時エラー時に指数バックオフで再試行する。"""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        attempt = 0
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                attempt += 1
+                if attempt >= _MAX_ATTEMPTS or not _is_transient(exc):
+                    raise
+                delay = _BASE_DELAY * (2 ** (attempt - 1))
+                delay += random.uniform(0, delay * 0.1)  # ジッターで同時再試行を分散
+                logger.warning(
+                    "Sheets API transient error (%s); retrying %d/%d in %.1fs",
+                    type(exc).__name__, attempt, _MAX_ATTEMPTS - 1, delay,
+                )
+                time.sleep(delay)
+
+    return wrapper
+
+
+def _install_retry(gc: gspread.Client) -> gspread.Client:
+    """gspreadクライアントの全API呼び出しに一時エラー再試行を仕込む。
+
+    HTTPクライアント層(全ての読み書きが通る単一経路)をラップするため、
+    open/worksheet/update/resize 等どのAPI呼び出しでもリトライが効く。
+    """
+    http_client = getattr(gc, "http_client", None)
+    request = getattr(http_client, "request", None)
+    if request is not None and not getattr(request, "_retry_wrapped", False):
+        wrapped = _retry_transient(request)
+        wrapped._retry_wrapped = True  # 二重ラップ防止
+        http_client.request = wrapped
+    else:
+        logger.debug("gspread retry not installed (unexpected client shape)")
+    return gc
 
 
 # --- 内部カラム名(BigQuery/データ処理用) ---
@@ -154,9 +229,9 @@ def _get_gspread_client() -> gspread.Client:
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path and os.path.exists(creds_path):
         logger.info("Authenticating gspread with key file: %s", creds_path)
-        return gspread.service_account(filename=creds_path)
+        return _install_retry(gspread.service_account(filename=creds_path))
     logger.info("Authenticating gspread with default location")
-    return gspread.service_account()
+    return _install_retry(gspread.service_account())
 
 
 def load_rows_to_sheets(

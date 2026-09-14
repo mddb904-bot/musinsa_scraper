@@ -55,6 +55,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
+          # ヘッドフルChromiumを仮想ディスプレイで動かすため xvfb を用意
+          sudo apt-get update && sudo apt-get install -y xvfb
 
       - name: Write GCP credentials
         run: |
@@ -65,7 +67,9 @@ jobs:
           ARGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
           if [ "${{ github.event.inputs.skip_exclusive }}" = "true" ]; then ARGS="$ARGS --skip-exclusive"; fi
-          python -m src.run_brand_ranking $ARGS
+          # Cloudflare対策: ヘッドフルChromiumを xvfb 仮想ディスプレイ上で実行する
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x1800x24' \
+            python -m src.run_brand_ranking $ARGS
 
       - name: Cleanup credentials
         if: always()
